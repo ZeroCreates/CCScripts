@@ -596,7 +596,7 @@ local function startCloud()
     term.clear()
     term.setCursorPos(1, 1)
     print("CLOUD CATCHER")
-    print("Enter the 32-character connection code.")
+    print("Enter the 32-character connection code from https://cloud-catcher.squiddev.cc/.")
     write("Code: ")
     local code = read("*")
     if not code or code == "" then
