@@ -683,7 +683,7 @@ local function chatHandler()
                     ) then
                         if runCommand(
                             "setCourse",
-                            "COURSE PROGRAMMED",
+                            "PLAYER REQUEST: COURSE PROGRAMMED",
                             player.x,
                             player.y,
                             player.z,
@@ -691,22 +691,44 @@ local function chatHandler()
                             true,
                             player.pitch
                         ) then
-                            runCommand("demat", "DEMATERIALIZATION COMMAND SENT")
+                            runCommand("demat", "TRAVELING TO PLAYER: " .. username)
                         end
                     end
                 end
             elseif command == "tardis go home" then
+                local places = call("getPlaces")
+                local savedPlace = {}
+                for id, place in pairs(places) do
+                    if type(place) == "table" and type(place.name) == "string" then
+                        if place.name == "Home" then
+                            savedPlace = {
+                                id = id,
+                                name = place.name,
+                                x = place.x,
+                                y = place.y,
+                                z = place.z,
+                                dimension = place.dimension,
+                                facing = place.facing
+                            }
+                        end
+                    end
+                end
+                if not savedPlace.name then
+                    notify("HOME DESTINATION NOT FOUND", C.red)
+                else
+                    notify("GOING HOME", C.lime)
+                end
                 if runCommand(
                     "setCourse",
-                    "COURSE PROGRAMMED",
-                    -601,
-                    65,
-                    -229,
-                    "minecraft:overworld",
+                    "GOING HOME : COURSE PROGRAMMED",
+                    savedPlace.x,
+                    savedPlace.y,
+                    savedPlace.z,
+                    savedPlace.dimension,
                     true,
-                    180
+                    savedPlace.facing
                 ) then
-                    runCommand("demat", "DEMATERIALIZATION COMMAND SENT")
+                    runCommand("demat", "GOING HOME : DEMATERIALIZATION")
                 end
             end
         end

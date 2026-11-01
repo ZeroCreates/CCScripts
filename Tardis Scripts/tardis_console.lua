@@ -524,37 +524,19 @@ local function drawSavePlace()
     header("SAVE LOCATION")
     printAt(2, 5, "Select a location ID to save.")
     printAt(2, 7, "LOCATION ID: " .. tostring(savePlaceId), colors.cyan)
+    savePlaceId = read()
+    local currentPlaces, placesError = call("getPlaces")
+    if type(currentPlaces) ~= "table" then
+        notify(placesError or "Unable to load locations.")
+        return
+    end
+    if currentPlaces[savePlaceId] or currentPlaces[tostring(savePlaceId)] then
+        notify("That location ID is already in use.")
+        return
+    end
 
-    button(2, 10, 10, "-10", "save_dec10", function()
-        savePlaceId = math.max(1, savePlaceId - 10)
-    end)
-    button(14, 10, 10, "-1", "save_dec1", function()
-        savePlaceId = math.max(1, savePlaceId - 1)
-    end)
-    button(26, 10, 10, "+1", "save_inc1", function()
-        savePlaceId = savePlaceId + 1
-    end)
-    button(38, 10, 10, "+10", "save_inc10", function()
-        savePlaceId = savePlaceId + 10
-    end)
-
-    addButton(14, "SAVE", "save_confirm", function()
-        local currentPlaces, placesError = call("getPlaces")
-        if type(currentPlaces) ~= "table" then
-            notify(placesError or "Unable to load locations.")
-            return
-        end
-        if currentPlaces[savePlaceId] or currentPlaces[tostring(savePlaceId)] then
-            notify("That location ID is already in use.")
-            return
-        end
-
-        execute("savePlace", savePlaceId)
-        page = "memory"
-    end, 1)
-    addButton(14, "CANCEL", "save_cancel", function()
-        page = "memory"
-    end, 2)
+    execute("savePlace", savePlaceId)
+    page = "memory"
 
     footer()
 end
