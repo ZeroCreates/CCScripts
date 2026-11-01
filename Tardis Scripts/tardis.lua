@@ -726,7 +726,7 @@ local function chatHandler()
                     savedPlace.z,
                     savedPlace.dimension,
                     true,
-                    savedPlace.facing
+                    savedPlace.facing or 0
                 ) then
                     runCommand("demat", "GOING HOME : DEMATERIALIZATION")
                 end
