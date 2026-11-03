@@ -680,7 +680,6 @@ local function commandPrompt()
     local function showPromptHelp()
         writePromptLine("Commands: cd, ls, pwd, mkdir, rm, cp, mv, wget, upload")
         writePromptLine("Aliases: dir, md, del, delete, copy, move, edit")
-        writePromptLine("Up/Down: browse recent commands.")
         writePromptLine("upload <file.lua> shares a Lua file. Quote paths with spaces.")
         writePromptLine("Lua paths, clear/cls, help, exit.")
     end
@@ -932,6 +931,14 @@ local function commandPrompt()
         if #previousArguments == 0 and rawPrefix:find("%s") == nil then
             local commandQuote = rawPrefix:match("^([\"'])")
             local commandPrefix = commandQuote and rawPrefix:sub(2) or rawPrefix
+            for _, candidate in ipairs({ "cd", "dir", "ls", "pwd", "mkdir", "md",
+                "rm", "del", "delete", "cp", "copy", "mv", "move", "wget", "upload", "edit",
+                "cls", "clear", "help", "exit" }) do
+                if not commandQuote
+                    and candidate:sub(1, #rawPrefix):lower() == rawPrefix:lower() then
+                    table.insert(candidates, candidate:sub(#rawPrefix + 1))
+                end
+            end
             local rootedPrefix = commandPrefix:gsub("^/+", "")
             local parent, leaf = rootedPrefix:match("^(.*)/([^/]*)$")
             if parent then
