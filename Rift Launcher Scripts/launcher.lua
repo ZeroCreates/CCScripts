@@ -49,6 +49,20 @@ local cloudServiceTerminal
 local cloudServiceStatus
 local cloudServiceErrorPath
 local cloudServiceCode
+local programTerminationRequested = false
+local pullEventWithCloud
+
+local function createProgramOs(parent)
+    local programOs = {}
+    for name, value in pairs(parent or nativeOs) do programOs[name] = value end
+    programOs.pullEvent = function(filter)
+        return pullEventWithCloud(filter, false, true)
+    end
+    programOs.pullEventRaw = function(filter)
+        return pullEventWithCloud(filter, true, true)
+    end
+    return programOs
+end
 
 local function createCloudMirrorTerminal(parent, mirror)
     local terminal = {}
@@ -516,6 +530,7 @@ end
 local function createSystemEnvironment()
     local environment = {}
     for name, value in pairs(_ENV) do environment[name] = value end
+    environment.os = createProgramOs(nativeOs)
     environment.launcherTheme = getThemeInfo()
     return environment
 end
@@ -1811,6 +1826,9 @@ local function runHomeProgram(programPath, profileContext, ...)
 
         local sandboxOs = {}
         for name, value in pairs(nativeOs) do sandboxOs[name] = value end
+        local programOs = createProgramOs(nativeOs)
+        sandboxOs.pullEvent = programOs.pullEvent
+        sandboxOs.pullEventRaw = programOs.pullEventRaw
         sandboxOs.loadAPI = nil
         sandboxOs.unloadAPI = nil
         local currentEnvironment = environment
@@ -2014,13 +2032,15 @@ local function resumeCloudService(...)
     end
 end
 
-local function pullEventWithCloud(filter, raw)
+pullEventWithCloud = function(filter, raw, allowTerminate)
     while true do
-        local event = table.pack(nativePullEventRaw())
+        local eventSource = allowTerminate and unfilteredPullEventRaw or nativePullEventRaw
+        local event = table.pack(eventSource())
         if cloudService and coroutine.running() ~= cloudService
             and (cloudServiceFilter == nil or cloudServiceFilter == event[1] or event[1] == "terminate") then
             resumeCloudService(table.unpack(event, 1, event.n))
         end
+        if event[1] == "terminate" and allowTerminate then error("Terminated", 0) end
         if filter == nil or event[1] == filter then
             if event[1] == "terminate" and not raw then error("Terminated", 0) end
             return table.unpack(event, 1, event.n)
@@ -2030,10 +2050,10 @@ local function pullEventWithCloud(filter, raw)
 end
 
 nativeOs.pullEvent = function(filter)
-    return pullEventWithCloud(filter, false)
+    return pullEventWithCloud(filter, false, false)
 end
 nativeOs.pullEventRaw = function(filter)
-    return pullEventWithCloud(filter, true)
+    return pullEventWithCloud(filter, true, false)
 end
 
 local function startCloudService(code, profileContext)
@@ -2153,6 +2173,7 @@ local function launchSelected(openInTab)
     local ok, result
     local profileProgramError
     local programErrors = {}
+    programTerminationRequested = false
     local originalPrintError = printError
     if not openInTab then
         printError = function(text)
@@ -2223,6 +2244,8 @@ local function launchSelected(openInTab)
         local runner = openInTab and nativeMultishell.launch or nativeOs.run
         ok, result = pcall(runner, createSystemEnvironment(), app.path, homeDirectory)
     end
+    local programTerminated = programTerminationRequested
+    programTerminationRequested = false
     if not openInTab then printError = originalPrintError end
     shell.setDir(previousDirectory)
     restoreCloudMirrorTerminal()
@@ -2249,19 +2272,22 @@ local function launchSelected(openInTab)
     end
     term.clear()
     term.setCursorPos(1, 1)
-    if not ok then
+    if not programTerminated and not ok then
         printError("Program error: " .. tostring(result))
-    elseif profileProgramError and #programErrors == 0 then
+    elseif not programTerminated and profileProgramError and #programErrors == 0 then
         printError("Profile program error: " .. profileProgramError)
-    elseif result == false and #programErrors == 0 then
+    elseif not programTerminated and result == false and #programErrors == 0 then
         printError("The program reported that it did not complete successfully.")
     end
-    for _, programError in ipairs(programErrors) do
-        printError("Program error: " .. programError)
+    if not programTerminated then
+        for _, programError in ipairs(programErrors) do
+            printError("Program error: " .. programError)
+        end
     end
-    local programFailed = not ok or result == false or profileProgramError ~= nil or #programErrors > 0
+    local programFailed = not programTerminated
+        and (not ok or result == false or profileProgramError ~= nil or #programErrors > 0)
     if programFailed then waitForReturn(true) end
-    if autoLaunchSession then
+    if autoLaunchSession and not programTerminated then
         autoLaunchSession = false
         currentUser = nil
         homeDirectory = nil
@@ -2279,7 +2305,11 @@ local function launchSelected(openInTab)
         end
         return
     end
-    if not programFailed then waitForReturn(false) end
+    if not programFailed and not programTerminated then waitForReturn(false) end
+            if event[1] == "terminate" and allowTerminate then
+                programTerminationRequested = true
+                error("Terminated", 0)
+            end
     if app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "")
         and cloudServiceStatus then
         message = "Cloud Catcher: " .. cloudServiceStatus

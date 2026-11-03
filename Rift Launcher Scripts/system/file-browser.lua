@@ -705,6 +705,7 @@ local function commandPrompt()
         term.setBackgroundColor(term.isColor() and themes[themeIndex].accent or colors.gray)
         term.write((" RIFT LAUNCHER // PROFILE COMMAND PROMPT"):sub(1, width))
         term.setBackgroundColor(colors.black)
+        term.setCursorPos(1, 2)
     end
     local function resolvePath(input)
         local path = resolveHomePath(workingDirectory, input)
