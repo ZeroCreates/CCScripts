@@ -145,10 +145,11 @@ local STARTUP_TEMPORARY_PATH = SYSTEM_DIRECTORY .. "/startup.lua.tmp"
 
 local function displayLauncherPath(path)
     local normalizedPath = tostring(path):gsub("^/+", "")
+    normalizedPath = normalizedPath:gsub("^%.launcher/users/", "users/")
     local systemProgramsPath = SYSTEM_APP_DIRECTORY:gsub("^/+", "")
     if normalizedPath == systemProgramsPath then return "S://" end
     if normalizedPath:sub(1, #systemProgramsPath + 1) == systemProgramsPath .. "/" then
-        return "S://" .. normalizedPath:sub(#systemProgramsPath + 1)
+        return "S://" .. normalizedPath:sub(#systemProgramsPath + 2)
     end
     local launcherPath = LAUNCHER_PATH:gsub("^/+", "")
     if normalizedPath == launcherPath then return "S://" .. launcherPath end
@@ -166,7 +167,7 @@ local function displayLauncherPath(path)
 end
 
 local function displayLauncherMessage(text)
-    text = tostring(text)
+    text = tostring(text):gsub("%.launcher/users/", "users/")
     local systemProgramsPattern = SYSTEM_APP_DIRECTORY:gsub("^/+", ""):gsub("([^%w])", "%%%1")
     text = text:gsub("/" .. systemProgramsPattern .. "/", "S://")
         :gsub("/" .. systemProgramsPattern .. "%f[%W]", "S://")
@@ -811,29 +812,39 @@ local function saveProfileAdmins(admins)
 end
 
 local function installDownloader()
-    if fs.exists(DOWNLOADER_PATH) and fs.exists(SYSTEM_FILE_BROWSER_PATH) then return true end
+    local function useInstalledDownloader(err)
+        if fs.exists(DOWNLOADER_PATH) and not fs.isDir(DOWNLOADER_PATH) then return true end
+        return false, err
+    end
+
     if not http or not http.get then
-        return false, "Enable the ComputerCraft HTTP API to download the app downloader."
+        return useInstalledDownloader("Enable the ComputerCraft HTTP API to download the app downloader.")
     end
 
     local ok, response, requestError = pcall(
         http.get, HOST_BASE_URL .. "computercraft/system/app-downloader.lua"
     )
-    if not ok then return false, "Downloader request failed: " .. tostring(response) end
+    if not ok then return useInstalledDownloader("Downloader request failed: " .. tostring(response)) end
     if not response then
-        return false, "Downloader request failed: " .. tostring(requestError or "HTTP request failed.")
+        return useInstalledDownloader("Downloader request failed: "
+            .. tostring(requestError or "HTTP request failed."))
     end
 
     local responseCode = response.getResponseCode and response.getResponseCode()
     if responseCode and responseCode ~= 200 then
         response.close()
-        return false, "Downloader request failed: host returned HTTP " .. responseCode .. "."
+        return useInstalledDownloader("Downloader request failed: host returned HTTP "
+            .. responseCode .. ".")
     end
 
     local contents = response.readAll()
     response.close()
     if not contents or contents == "" then
-        return false, "Downloader download failed: the file was empty."
+        return useInstalledDownloader("Downloader download failed: the file was empty.")
+    end
+    local compiled, compileError = loadstring(contents, "@app-downloader.lua")
+    if not compiled then
+        return useInstalledDownloader("Downloader download failed: " .. tostring(compileError))
     end
 
     local temporary = DOWNLOADER_PATH .. ".download-tmp"
@@ -842,22 +853,27 @@ local function installDownloader()
     if fs.exists(temporary) then fs.delete(temporary) end
     if fs.exists(backup) then fs.delete(backup) end
     local file = fs.open(temporary, "w")
-    if not file then return false, "Could not create " .. temporary .. "." end
-    file.write(contents)
-    file.close()
+    if not file then return useInstalledDownloader("Could not create " .. temporary .. ".") end
+    local wrote, writeError = pcall(file.write, contents)
+    local closed, closeError = pcall(file.close)
+    if not wrote or not closed then
+        if fs.exists(temporary) then fs.delete(temporary) end
+        return useInstalledDownloader("Could not write the app downloader: "
+            .. tostring(not wrote and writeError or closeError))
+    end
 
     if fs.exists(DOWNLOADER_PATH) then
         local backedUp, backupError = pcall(fs.move, DOWNLOADER_PATH, backup)
         if not backedUp then
             fs.delete(temporary)
-            return false, "Could not back up the app downloader: " .. tostring(backupError)
+            return useInstalledDownloader("Could not back up the app downloader: " .. tostring(backupError))
         end
     end
     local moved, moveError = pcall(fs.move, temporary, DOWNLOADER_PATH)
     if not moved then
         if fs.exists(temporary) then fs.delete(temporary) end
         if fs.exists(backup) then fs.move(backup, DOWNLOADER_PATH) end
-        return false, "Could not install the app downloader: " .. tostring(moveError)
+        return useInstalledDownloader("Could not install the app downloader: " .. tostring(moveError))
     end
     if fs.exists(backup) then fs.delete(backup) end
     return true

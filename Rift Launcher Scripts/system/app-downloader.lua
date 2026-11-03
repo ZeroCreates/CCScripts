@@ -24,10 +24,11 @@ local themes = {
 
 local function displayPath(path)
     local normalizedPath = tostring(path):gsub("^/+", "")
+    normalizedPath = normalizedPath:gsub("^%.launcher/users/", "users/")
     local systemPath = SYSTEM_APP_DIRECTORY:gsub("^/+", "")
     if normalizedPath == systemPath then return "S://" end
     if normalizedPath:sub(1, #systemPath + 1) == systemPath .. "/" then
-        return "S://" .. normalizedPath:sub(#systemPath + 1)
+        return "S://" .. normalizedPath:sub(#systemPath + 2)
     end
     local normalizedHome = homeDirectory:gsub("^/+", ""):gsub("/+$", "")
     if normalizedPath == normalizedHome then return "H://" end

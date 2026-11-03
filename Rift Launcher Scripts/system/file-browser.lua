@@ -151,6 +151,7 @@ end
 
 local function displayPath(path)
     local normalizedPath = path:gsub("^/+", "")
+    normalizedPath = normalizedPath:gsub("^%.launcher/users/", "users/")
     if normalizedPath == systemProgramsDirectory then return "S://" end
     if isWithinRoot(normalizedPath, systemProgramsDirectory) then
         return "S://" .. normalizedPath:sub(#systemProgramsDirectory + 2)
@@ -176,6 +177,7 @@ local function displayPath(path)
 end
 
 local function displayMessage(text)
+    text = text:gsub("%.launcher/users/", "users/")
     local systemProgramsPattern = systemProgramsDirectory:gsub("([^%w])", "%%%1")
     text = text:gsub("/" .. systemProgramsPattern .. "/", "S://")
         :gsub("/" .. systemProgramsPattern, "S://")
@@ -193,7 +195,9 @@ local function displayMessage(text)
         end
     end
     local homePattern = homeDirectory:gsub("([^%w])", "%%%1")
-    return (text:gsub(homePattern .. "/", "H://"):gsub(homePattern, "H://"))
+    text = text:gsub(homePattern .. "/", "H://"):gsub(homePattern, "H://")
+    return (text:gsub("users/([%w_-]+)/", "H@%1://")
+        :gsub("users/([%w_-]+)%f[%W]", "H@%1://"))
 end
 
 local function refreshDiskMounts()
