@@ -7,6 +7,7 @@ local privateDataDirectory = fs.combine(".launcher", "user-data", username)
 local shellDirectory = fs.combine(homeDirectory, "shell")
 local encryptionKeyPath = "/.launcher/.data-key"
 local profilesDirectory = "users"
+local SHARE_UPLOAD_URL = "https://rift.zerocreates.org/api/share"
 local currentDirectory = fs.combine(homeDirectory, "desktop")
 local currentRoot = homeDirectory
 local authorizedProfileRoot
@@ -389,7 +390,7 @@ local function draw()
     term.clear()
     term.setCursorPos(1, 1)
     term.setBackgroundColor(accent)
-    term.write((" FILE BROWSER"):sub(1, width))
+    term.write((" RIFT LAUNCHER // FILE BROWSER"):sub(1, width))
     term.setBackgroundColor(colors.black)
     term.setCursorPos(2, 2)
     term.setTextColor(colors.lightGray)
@@ -677,9 +678,11 @@ local function commandPrompt()
         print(tostring(text):sub(1, width))
     end
     local function showPromptHelp()
-        writePromptLine("Commands: cd, ls, pwd, mkdir, rm, cp, mv, wget")
+        writePromptLine("Commands: cd, ls, pwd, mkdir, rm, cp, mv, wget, upload")
         writePromptLine("Aliases: dir, md, del, delete, copy, move, edit")
-        writePromptLine("Lua paths, clear/cls, help, exit. Quote paths with spaces.")
+        writePromptLine("Up/Down: browse recent commands.")
+        writePromptLine("upload <file.lua> shares a Lua file. Quote paths with spaces.")
+        writePromptLine("Lua paths, clear/cls, help, exit.")
     end
     local function drawPromptHeader()
         term.setBackgroundColor(colors.black)
@@ -687,7 +690,7 @@ local function commandPrompt()
         term.clear()
         term.setCursorPos(1, 1)
         term.setBackgroundColor(term.isColor() and themes[themeIndex].accent or colors.gray)
-        term.write((" PROFILE COMMAND PROMPT"):sub(1, width))
+        term.write((" RIFT LAUNCHER // PROFILE COMMAND PROMPT"):sub(1, width))
         term.setBackgroundColor(colors.black)
         writePromptLine("Only programs and files in your home directory are available.", colors.lightGray)
         showPromptHelp()
@@ -777,6 +780,68 @@ local function commandPrompt()
             return false, "Could not save download: " .. tostring(writeOk and fileCloseError or writeError)
         end
         return true, "Downloaded " .. tostring(#contents) .. " bytes to " .. displayPath(destination) .. "."
+    end
+    local function uploadFile(sourceInput)
+        if type(http) ~= "table" or type(http.post) ~= "function" then
+            return false, "Enable the ComputerCraft HTTP API to upload files."
+        end
+        if type(sourceInput) ~= "string" or sourceInput == "" then
+            return false, "Usage: upload <file.lua>"
+        end
+
+        local source = resolvePath(sourceInput)
+        if not source or source == homeDirectory or not fs.exists(source) or fs.isDir(source) then
+            return false, "File not found inside your home directory."
+        end
+        local fileName = fs.getName(source)
+        if not fileName:match("^[%w_.%-]+%.lua$") then
+            return false, "Only .lua files can be uploaded."
+        end
+
+        local file, openError = fs.open(source, "rb")
+        if not file then return false, "Could not open file: " .. tostring(openError) end
+        local readOk, contents = pcall(file.readAll)
+        local closeOk, closeError = pcall(file.close)
+        if not readOk then return false, "Could not read file: " .. tostring(contents) end
+        if not closeOk then return false, "Could not close file: " .. tostring(closeError) end
+        if type(contents) ~= "string" then return false, "File did not contain readable bytes." end
+
+        local requestOk, response, requestError = pcall(http.post, SHARE_UPLOAD_URL, contents, {
+            ["Content-Type"] = "application/octet-stream",
+            ["X-Filename"] = fileName,
+        })
+        if not requestOk then return false, "Upload request failed: " .. tostring(response) end
+        if not response then
+            return false, "Upload request failed: " .. tostring(requestError or "no response")
+        end
+
+        local responseCode
+        if type(response.getResponseCode) == "function" then
+            local codeOk, code = pcall(response.getResponseCode)
+            if not codeOk then
+                pcall(response.close)
+                return false, "Could not read the upload response status: " .. tostring(code)
+            end
+            responseCode = code
+        end
+        if responseCode and (responseCode < 200 or responseCode >= 300) then
+            pcall(response.close)
+            return false, "Upload failed with HTTP " .. tostring(responseCode) .. "."
+        end
+
+        local responseOk, responseBody = pcall(response.readAll)
+        local responseClosed, responseCloseError = pcall(response.close)
+        if not responseOk then return false, "Could not read upload response: " .. tostring(responseBody) end
+        if not responseClosed then
+            return false, "Could not close upload response: " .. tostring(responseCloseError)
+        end
+        local decoded, share = pcall(textutils.unserializeJSON, responseBody)
+        if not decoded or type(share) ~= "table"
+            or type(share.id) ~= "string" or share.id == ""
+            or type(share.url) ~= "string" or share.url == "" then
+            return false, "Share server returned an invalid response."
+        end
+        return true, share.id, share.url
     end
     local function resolveProgram(command)
         local paths = {}
@@ -868,7 +933,7 @@ local function commandPrompt()
             local commandQuote = rawPrefix:match("^([\"'])")
             local commandPrefix = commandQuote and rawPrefix:sub(2) or rawPrefix
             for _, candidate in ipairs({ "cd", "dir", "ls", "pwd", "mkdir", "md",
-                "rm", "del", "delete", "cp", "copy", "mv", "move", "wget", "edit",
+                "rm", "del", "delete", "cp", "copy", "mv", "move", "wget", "upload", "edit",
                 "cls", "clear", "help", "exit" }) do
                 if not commandQuote
                     and candidate:sub(1, #rawPrefix):lower() == rawPrefix:lower() then
@@ -911,7 +976,7 @@ local function commandPrompt()
                 or commandName == "rm" or commandName == "del" or commandName == "delete"
                 or commandName == "cp" or commandName == "copy"
                 or commandName == "mv" or commandName == "move" or commandName == "edit"
-                or commandName == "wget"
+                or commandName == "wget" or commandName == "upload"
             local supportsTwoPaths = commandName == "cp" or commandName == "copy"
                 or commandName == "mv" or commandName == "move"
             local needsPath = supportsTwoPaths and #previousArguments <= 2
@@ -934,7 +999,7 @@ local function commandPrompt()
                         local candidatePath = fs.combine(directory, name)
                         local isDirectory = fs.isDir(candidatePath)
                         local wantsDirectory = commandName == "cd"
-                        local wantsFile = commandName == "edit"
+                        local wantsFile = commandName == "edit" or commandName == "upload"
                         if (not wantsDirectory or isDirectory)
                             and (not wantsFile or not isDirectory) then
                             local candidate = (parent and parent ~= "" and parent .. "/" or "")
@@ -1066,6 +1131,18 @@ local function commandPrompt()
                 else
                     local ok, result = downloadFile(arguments[2], arguments[3])
                     writePromptLine(result, ok and colors.lime or colors.red)
+                end
+            elseif command == "upload" then
+                if not arguments[2] or #arguments > 2 then
+                    writePromptLine("Usage: upload <file.lua>", colors.red)
+                else
+                    local ok, id, url = uploadFile(arguments[2])
+                    if ok then
+                        writePromptLine(id, colors.lime)
+                        writePromptLine(url, colors.cyan)
+                    else
+                        writePromptLine(id, colors.red)
+                    end
                 end
             elseif command == "edit" then
                 local path = arguments[2] and resolveHomePath(workingDirectory, arguments[2])

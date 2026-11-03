@@ -1,6 +1,6 @@
-# Warning
+# Rift Launcher Warning
 
-These scripts in this folder are from the development branch and may be unstable or incomplete.
+These Rift Launcher scripts are from the development branch and may be unstable or incomplete.
 
 Please use the official release location instead:
 https://rift.zerocreates.org/

@@ -523,8 +523,24 @@ end
 local function drawSavePlace()
     header("SAVE LOCATION")
     printAt(2, 5, "Select a location ID to save.")
-    printAt(2, 7, "LOCATION ID: " .. tostring(savePlaceId), colors.cyan)
     savePlaceId = read()
+    printAt(2, 7, "LOCATION ID: " .. tostring(savePlaceId), colors.cyan)
+    course = call("getCourse")
+    x= course.x
+    y= course.y
+    z= course.z
+    printAt(2, 9, "Current Position: " .. tostring(x) .. ", " .. tostring(y) .. ", " .. tostring(z), colors.white)
+    printAt(2, 10, "Enter a rotation value (0-360): ", colors.white)
+    rotation = read()
+    execute(
+            "setCourse",
+            x,
+            y,
+            z,
+            course.dimension,
+            true,
+            rotation
+        )
     local currentPlaces, placesError = call("getPlaces")
     if type(currentPlaces) ~= "table" then
         notify(placesError or "Unable to load locations.")

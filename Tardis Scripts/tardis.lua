@@ -490,8 +490,10 @@ local function askName(prompt)
     term.setCursorPos(1, 1)
     print(prompt)
     local name = read()
+    print("Enter Rotation (0-360):")
+    local rotation = tonumber(read()) or 0
     term.redirect(monitor)
-    return name
+    return name, rotation
 end
 
 local function runCommand(method, successMessage, ...)
@@ -585,8 +587,11 @@ local function execute(id)
         runCommand("scan", "SCANNER ACTIVATED")
 
     elseif id == "save" then
-        local name = askName("Enter destination name:")
+        local name, rotation = askName("Enter destination name:")
         if name ~= "" then
+            course = getCourse()
+            local x, y, z = course.x, course.y, course.z
+            execute("setCourse", x, y, z, course.dimension, true, rotation)
             local _, err = call("savePlace", name)
             notify(err or "PLACE SAVED", err and C.red or C.lime)
         end

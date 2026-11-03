@@ -4,6 +4,7 @@ local SYSTEM_FILE_BROWSER_PATH = SYSTEM_APP_DIRECTORY .. "/file-browser.lua"
 local SYSTEM_CLOUD_PATH = SYSTEM_APP_DIRECTORY .. "/cloud.lua"
 local SETTINGS_PROGRAM_PATH = SYSTEM_APP_DIRECTORY .. "/settings.lua"
 local HOST_BASE_URL = "https://rift.zerocreates.org/"
+local LAUNCHER_PATH = "/launcher.lua"
 local nativeFs = fs
 local nativeOs = os
 local nativeRequire = require
@@ -13,6 +14,22 @@ local nativePrintError = printError
 local nativeSettingsApi = _G.settings
 local nativePullEvent = nativeOs.pullEvent
 local nativePullEventRaw = nativeOs.pullEventRaw
+local bootLocked = true
+local unfilteredPullEventRaw = nativePullEventRaw
+nativePullEventRaw = function(filter)
+    while true do
+        local event = table.pack(unfilteredPullEventRaw(filter))
+        if not bootLocked or event[1] ~= "terminate" then
+            return table.unpack(event, 1, event.n)
+        end
+    end
+end
+nativeOs.pullEventRaw = nativePullEventRaw
+nativeOs.pullEvent = function(filter)
+    local event = table.pack(nativePullEventRaw(filter))
+    if event[1] == "terminate" then error("Terminated", 0) end
+    return table.unpack(event, 1, event.n)
+end
 local apps = {}
 local selected = 1
 local firstVisible = 1
@@ -134,6 +151,132 @@ local THEMES = {
 }
 local DEFAULT_CYAN = { 0.298, 0.600, 0.698 }
 local DEFAULT_BLUE = { 0.200, 0.400, 0.800 }
+
+local function drawBootScreen()
+    local width, height = term.getSize()
+    local accent = term.isColor() and colors.cyan or colors.white
+    local centerRow = math.max(1, math.floor(height / 2))
+    local logo = {
+        "RRRR   III  FFFF  TTTTT",
+        "R   R   I   F       T",
+        "RRRR    I   FFF     T",
+        "R R     I   F       T",
+        "R  RR  III  F       T",
+    }
+    local function writeCentered(row, text, color)
+        text = tostring(text):sub(1, width)
+        term.setCursorPos(math.max(1, math.floor((width - #text) / 2) + 1), row)
+        term.setTextColor(color)
+        term.write(text)
+    end
+
+    term.setBackgroundColor(colors.black)
+    term.clear()
+    if width >= 24 and height >= 12 then
+        for index, line in ipairs(logo) do
+            writeCentered(centerRow - 4 + index, line, accent)
+        end
+        writeCentered(math.min(height, centerRow + 1), "LAUNCHER", colors.lightGray)
+    else
+        writeCentered(math.max(1, centerRow - 1), "RIFT", accent)
+        writeCentered(math.min(height, centerRow + 1), "LAUNCHER", colors.lightGray)
+    end
+end
+
+local function startBootPhase()
+    drawBootScreen()
+    sleep(0.7)
+end
+
+local function autoUpdateLauncher()
+    drawBootScreen()
+    if not http or type(http.get) ~= "function" then
+        drawBootScreen()
+        return
+    end
+
+    local requested, response, requestError = pcall(http.get, HOST_BASE_URL .. "launcher.lua")
+    if not requested or not response then
+        drawBootScreen()
+        return
+    end
+
+    local responseCode = response.getResponseCode and response.getResponseCode()
+    if responseCode and responseCode ~= 200 then
+        response.close()
+        drawBootScreen()
+        return
+    end
+
+    local readOk, contents = pcall(response.readAll)
+    response.close()
+    if not readOk or type(contents) ~= "string" or contents == "" then
+        drawBootScreen()
+        return
+    end
+
+    contents = contents:gsub("^\239\187\191", "")
+    contents = contents:gsub("\r\n", "\n"):gsub("\r", "\n")
+    if fs.exists(LAUNCHER_PATH) then
+        local currentFile = fs.open(LAUNCHER_PATH, "r")
+        if currentFile then
+            local currentContents = currentFile.readAll()
+            currentFile.close()
+            currentContents = currentContents:gsub("^\239\187\191", "")
+            currentContents = currentContents:gsub("\r\n", "\n"):gsub("\r", "\n")
+            if contents == currentContents then
+                drawBootScreen()
+                return
+            end
+        end
+    end
+
+    local compiled, compileError = loadstring(contents, "@launcher.lua")
+    if not compiled then
+        drawBootScreen()
+        return
+    end
+
+    drawBootScreen()
+    local temporary = LAUNCHER_PATH .. ".update-tmp"
+    local backup = LAUNCHER_PATH .. ".update-bak"
+    if fs.exists(temporary) then fs.delete(temporary) end
+    if fs.exists(backup) then fs.delete(backup) end
+    local file = fs.open(temporary, "w")
+    if not file then
+        drawBootScreen()
+        return
+    end
+    local wrote, writeError = pcall(file.write, contents)
+    local closed, closeError = pcall(file.close)
+    if not wrote or not closed then
+        if fs.exists(temporary) then fs.delete(temporary) end
+        drawBootScreen()
+        return
+    end
+
+    if fs.exists(LAUNCHER_PATH) then
+        local backedUp, backupError = pcall(fs.move, LAUNCHER_PATH, backup)
+        if not backedUp then
+            fs.delete(temporary)
+            drawBootScreen()
+            return
+        end
+    end
+
+    local moved, moveError = pcall(fs.move, temporary, LAUNCHER_PATH)
+    if not moved then
+        if fs.exists(temporary) then fs.delete(temporary) end
+        if fs.exists(backup) then pcall(fs.move, backup, LAUNCHER_PATH) end
+        drawBootScreen()
+        return
+    end
+    if fs.exists(backup) then fs.delete(backup) end
+
+    drawBootScreen()
+    if type(nativeOs.reboot) == "function" then nativeOs.reboot() end
+end
+
 local function validHexColor(value)
     return type(value) == "string" and value:match("^#?%x%x%x%x%x%x$") ~= nil
 end
@@ -1174,7 +1317,7 @@ local function draw()
     term.clear()
     term.setCursorPos(1, 1)
     term.setBackgroundColor(titleColor)
-    term.write((" " .. "COMPUTERCRAFT LAUNCHER - " .. tostring(currentUser)):sub(1, width))
+    term.write((" RIFT LAUNCHER - " .. tostring(currentUser)):sub(1, width))
     term.setBackgroundColor(backgroundColor)
     term.setCursorPos(2, 2)
     term.setTextColor(mutedColor)
@@ -2134,6 +2277,8 @@ local function openSystemSettings()
 end
 
 local function launcherMain()
+startBootPhase()
+startBootPhase()
 local migrateLegacySettings = not fs.exists(SETTINGS_PATH) and fs.exists(LEGACY_SETTINGS_PATH)
 local keyReady, keyError = ensureEncryptionKey()
 if not keyReady then error(keyError, 0) end
@@ -2148,10 +2293,14 @@ if migrateLegacySettings or settingsNeedEncryption then
     if migrateLegacySettings then fs.delete(LEGACY_SETTINGS_PATH) end
 end
 
+local downloaderReady, downloaderError = installDownloader()
+startBootPhase()
+autoUpdateLauncher()
+
+startBootPhase()
 chooseUser()
 local systemAppsInstalled = false
 local systemAppInstallMessage
-local downloaderReady, downloaderError = installDownloader()
 if downloaderReady then
     local ok, result = pcall(nativeOs.run, _ENV, DOWNLOADER_PATH, "install-system", homeDirectory)
     if ok and result ~= false then
