@@ -33,7 +33,7 @@ end
 local apps = {}
 local selected = 1
 local firstVisible = 1
-local message = "Select a program to launch."
+local message = ""
 local shiftDown = false
 local currentUser
 local homeDirectory
@@ -142,6 +142,47 @@ local ENCRYPTION_KEY_PATH = SYSTEM_DIRECTORY .. "/.data-key"
 local LEGACY_SETTINGS_PATH = "/.launcher-settings.json"
 local STARTUP_PATH = "/startup.lua"
 local STARTUP_TEMPORARY_PATH = SYSTEM_DIRECTORY .. "/startup.lua.tmp"
+
+local function displayLauncherPath(path)
+    local normalizedPath = tostring(path):gsub("^/+", "")
+    local systemProgramsPath = SYSTEM_APP_DIRECTORY:gsub("^/+", "")
+    if normalizedPath == systemProgramsPath then return "S://" end
+    if normalizedPath:sub(1, #systemProgramsPath + 1) == systemProgramsPath .. "/" then
+        return "S://" .. normalizedPath:sub(#systemProgramsPath + 1)
+    end
+    local launcherPath = LAUNCHER_PATH:gsub("^/+", "")
+    if normalizedPath == launcherPath then return "S://" .. launcherPath end
+    if normalizedPath:sub(1, #launcherPath + 1) == launcherPath .. "." then
+        return "S://" .. normalizedPath
+    end
+    if homeDirectory then
+        local normalizedHome = homeDirectory:gsub("^/+", ""):gsub("/+$", "")
+        if normalizedPath == normalizedHome then return "H://" end
+        if normalizedPath:sub(1, #normalizedHome + 1) == normalizedHome .. "/" then
+            return "H://" .. normalizedPath:sub(#normalizedHome + 2)
+        end
+    end
+    return tostring(path)
+end
+
+local function displayLauncherMessage(text)
+    text = tostring(text)
+    local systemProgramsPattern = SYSTEM_APP_DIRECTORY:gsub("^/+", ""):gsub("([^%w])", "%%%1")
+    text = text:gsub("/" .. systemProgramsPattern .. "/", "S://")
+        :gsub("/" .. systemProgramsPattern .. "%f[%W]", "S://")
+    local launcherPattern = LAUNCHER_PATH:gsub("^/+", ""):gsub("([^%w])", "%%%1")
+    text = text:gsub("/" .. launcherPattern .. "([%p%s])", "S://" .. LAUNCHER_PATH:gsub("^/+", "") .. "%1")
+        :gsub("/" .. launcherPattern .. "$", "S://" .. LAUNCHER_PATH:gsub("^/+", ""))
+    if homeDirectory then
+        local homePattern = homeDirectory:gsub("^/+", ""):gsub("([^%w])", "%%%1")
+        text = text:gsub("/" .. homePattern .. "/", "H://")
+            :gsub("/" .. homePattern .. "%f[%W]", "H://")
+    end
+    text = text:gsub("/users/([%w_-]+)/", "H@%1://")
+        :gsub("/users/([%w_-]+)%f[%W]", "H@%1://")
+    return text
+end
+
 local THEMES = {
     { name = "Ocean", accent = colors.cyan, highlight = colors.blue },
     { name = "Forest", accent = colors.lime, highlight = colors.green },
@@ -980,7 +1021,6 @@ local function chooseUser(skipAutoLogin)
         term.setBackgroundColor(colors.black)
         term.setCursorPos(2, 2)
         term.setTextColor(colors.lightGray)
-        term.write(("Welcome back. Choose a profile to continue."):sub(1, math.max(0, width - 2)))
         term.setCursorPos(2, 3)
         term.setTextColor(accent)
         term.write((#users .. (#users == 1 and " PROFILE" or " PROFILES")):sub(1, math.max(0, width - 2)))
@@ -1003,11 +1043,6 @@ local function chooseUser(skipAutoLogin)
             term.setCursorPos(2, height - 3)
             term.setTextColor(colors.yellow)
             term.write(profileMessage:sub(1, math.max(0, width - 2)))
-        else
-            term.setCursorPos(2, height - 3)
-            term.setTextColor(colors.lightGray)
-            term.write(("N/V: change profile page  |  Click a profile twice to open.")
-                :sub(1, math.max(0, width - 2)))
         end
         term.setCursorPos(2, height - 2)
         term.setTextColor(colors.yellow)
@@ -1269,7 +1304,7 @@ local function refreshApps()
     if #apps == 0 then
         selected = 1
         firstVisible = 1
-        message = "No Lua programs found in " .. homeDirectory .. "."
+        message = "No Lua programs found in " .. displayLauncherPath(homeDirectory) .. "."
         return
     end
     selected = math.min(selected, #apps)
@@ -1321,7 +1356,7 @@ local function draw()
     term.setBackgroundColor(backgroundColor)
     term.setCursorPos(2, 2)
     term.setTextColor(mutedColor)
-    term.write(("YOUR PROGRAMS  |  N/V: PAGE"):sub(1, math.max(0, width - 2)))
+    term.write("YOUR PROGRAMS":sub(1, math.max(0, width - 2)))
 
     local lastVisible = math.min(#apps, firstVisible + visibleRows - 1)
     for index = firstVisible, lastVisible do
@@ -1337,11 +1372,6 @@ local function draw()
             term.write(("    " .. apps[index].name):sub(1, math.max(0, width - 2)))
         end
     end
-    term.setCursorPos(2, height - 6)
-    term.setTextColor(titleColor)
-    local selectedApp = apps[selected]
-    local detail = selectedApp and "Ready to launch" or "No programs found"
-    term.write(detail:sub(1, math.max(0, width - 2)))
     firstButtons = {
         { label = "UPDATE", action = "update" },
         { label = "OPEN TAB", action = "tab" },
@@ -1356,17 +1386,23 @@ local function draw()
 
     term.setCursorPos(2, height - 4)
     term.setTextColor(mutedColor)
-    term.write(message:sub(1, math.max(0, width - 2)))
+    term.write(displayLauncherMessage(message):sub(1, math.max(0, width - 2)))
     term.setBackgroundColor(backgroundColor)
     term.setTextColor(textColor)
     return firstButtons, secondButtons
 end
 
-local function waitForReturn()
+local function waitForReturn(waitForKey)
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.lightGray)
-    print("")
-    print("Exiting the program and returning to the launcher.")
+    if waitForKey then
+        print("")
+        print("Press any key to return to Rift Launcher.")
+        while true do
+            local event = os.pullEventRaw()
+            if event == "key" or event == "mouse_click" then return end
+        end
+    end
     sleep(.5)
 end
 
@@ -1389,17 +1425,16 @@ local function updateSelected()
     term.setTextColor(colors.white)
     term.clear()
     term.setCursorPos(1, 1)
-    print("Opening the app downloader to update " .. app.name .. "...")
     local ok, result = pcall(os.run, _ENV, DOWNLOADER_PATH, "update", fs.getName(app.path), homeDirectory)
     if not ok then
         printError("Could not run the app downloader: " .. tostring(result))
     elseif result == false then
         printError("The app downloader did not complete successfully.")
     end
-    waitForReturn()
+    waitForReturn(not ok or result == false)
     shiftDown = false
     refreshApps()
-    message = "Returned from the app downloader."
+    message = ""
 end
 
 local function isInHomeDirectory(path)
@@ -2097,12 +2132,18 @@ local function launchSelected(openInTab)
     term.setTextColor(colors.white)
     term.clear()
     term.setCursorPos(1, 1)
-    print("Launching " .. app.name .. "...")
-
     local previousDirectory = shell.dir()
     shell.setDir(homeDirectory)
     local ok, result
     local profileProgramError
+    local programErrors = {}
+    local originalPrintError = printError
+    if not openInTab then
+        printError = function(text)
+            programErrors[#programErrors + 1] = tostring(text)
+            originalPrintError(text)
+        end
+    end
     if isInHomeDirectory(app.path) then
         launchHomeProgramInTab = openInTab == true
         ok, result = pcall(runHomeProgram, app.path, profileContext, profileContext.homeDirectory)
@@ -2166,6 +2207,7 @@ local function launchSelected(openInTab)
         local runner = openInTab and nativeMultishell.launch or nativeOs.run
         ok, result = pcall(runner, createSystemEnvironment(), app.path, homeDirectory)
     end
+    if not openInTab then printError = originalPrintError end
     shell.setDir(previousDirectory)
     restoreCloudMirrorTerminal()
     if app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "")
@@ -2184,7 +2226,7 @@ local function launchSelected(openInTab)
             if type(nativeMultishell.setFocus) == "function" then
                 pcall(nativeMultishell.setFocus, result)
             end
-            message = "Opened " .. app.name .. " in a new tab."
+            message = ""
         end
         refreshApps()
         return
@@ -2193,11 +2235,16 @@ local function launchSelected(openInTab)
     term.setCursorPos(1, 1)
     if not ok then
         printError("Program error: " .. tostring(result))
-    elseif result == false then
-        printError("The program reported that it did not complete successfully.")
-    elseif profileProgramError then
+    elseif profileProgramError and #programErrors == 0 then
         printError("Profile program error: " .. profileProgramError)
+    elseif result == false and #programErrors == 0 then
+        printError("The program reported that it did not complete successfully.")
     end
+    for _, programError in ipairs(programErrors) do
+        printError("Program error: " .. programError)
+    end
+    local programFailed = not ok or result == false or profileProgramError ~= nil or #programErrors > 0
+    if programFailed then waitForReturn(true) end
     if autoLaunchSession then
         autoLaunchSession = false
         currentUser = nil
@@ -2212,16 +2259,16 @@ local function launchSelected(openInTab)
         elseif result == false then
             message = "Signed out after " .. app.name .. " did not complete successfully."
         else
-            message = "Signed out after " .. app.name .. " was closed."
+            message = ""
         end
         return
     end
-    waitForReturn()
+    if not programFailed then waitForReturn(false) end
     if app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "")
         and cloudServiceStatus then
         message = "Cloud Catcher: " .. cloudServiceStatus
     else
-        message = "Returned from " .. app.name .. "."
+        message = ""
     end
     if app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "") then
         loadSettings()
@@ -2271,8 +2318,6 @@ local function openSystemSettings()
         message = "Cloud Catcher: " .. cloudServiceStatus
     elseif result == false then
         message = "System Settings did not complete successfully."
-    else
-        message = "Returned from System Settings."
     end
 end
 
@@ -2299,13 +2344,10 @@ autoUpdateLauncher()
 
 startBootPhase()
 chooseUser()
-local systemAppsInstalled = false
 local systemAppInstallMessage
 if downloaderReady then
     local ok, result = pcall(nativeOs.run, _ENV, DOWNLOADER_PATH, "install-system", homeDirectory)
-    if ok and result ~= false then
-        systemAppsInstalled = true
-    else
+    if not ok or result == false then
         systemAppInstallMessage = ok
             and "Could not automatically install system apps: the downloader did not complete successfully."
             or "Could not run system app installation: " .. tostring(result)
@@ -2321,10 +2363,6 @@ elseif startupError then
     message = startupError
 elseif systemAppInstallMessage then
     message = systemAppInstallMessage
-elseif systemAppsInstalled then
-    message = "System apps are ready."
-else
-    message = "Select a program to launch."
 end
 
 if settings.autoLaunchPath then
@@ -2386,13 +2424,13 @@ while true do
                     selected = 1
                     firstVisible = 1
                     refreshApps()
-                    message = "Switched to " .. currentUser .. "."
+                    message = ""
                 else
-                    message = "Profile switch cancelled."
+                    message = ""
                 end
             elseif action == "refresh" then
                 refreshApps()
-                message = "Program list refreshed."
+                message = ""
             end
         end
     end

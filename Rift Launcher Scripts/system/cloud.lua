@@ -551,6 +551,22 @@ local profileRoot
 if type(profileHomeDirectory) == "string" then
   profileRoot = nativeFs.combine("/", profileHomeDirectory)
 end
+local function displayPath(path)
+  local normalizedPath = tostring(path):gsub("^/+", "")
+  if profileRoot then
+    local normalizedHome = profileRoot:gsub("^/+", ""):gsub("/+$", "")
+    if normalizedPath == normalizedHome then return "H://" end
+    if normalizedPath:sub(1, #normalizedHome + 1) == normalizedHome .. "/" then
+      return "H://" .. normalizedPath:sub(#normalizedHome + 2)
+    end
+  end
+  local systemProgramsPath = ".launcher/apps"
+  if normalizedPath == systemProgramsPath then return "S://" end
+  if normalizedPath:sub(1, #systemProgramsPath + 1) == systemProgramsPath .. "/" then
+    return "S://" .. normalizedPath:sub(#systemProgramsPath + 1)
+  end
+  return tostring(path)
+end
 local function resolveProfilePath(path)
   if type(path) ~= "string" then return nil, "File paths must be strings." end
   local normalized = path:gsub("\\", "/")
@@ -627,12 +643,12 @@ if _G.cloud_catcher then
           resolved = resolved .. "." .. extension
       end
     end
-    if fs.isDir(resolved) then error(("%q is a directory"):format(file), 0) end
+    if fs.isDir(resolved) then error(("%q is a directory"):format(displayPath(resolved)), 0) end
     if fs.isReadOnly(resolved) then
       if fs.exists(resolved) then
-        print(("%q is read only, will not be able to modify"):format(file))
+        print(("%q is read only, will not be able to modify"):format(displayPath(resolved)))
       else
-        error(("%q does not exist"):format(file), 0)
+        error(("%q does not exist"):format(displayPath(resolved)), 0)
       end
     end
     local ok, err = _G.cloud_catcher.edit(resolved)

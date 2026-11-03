@@ -12,7 +12,7 @@ local APP_NAMES_PATH = SYSTEM_DIRECTORY .. "/app-catalog-names.json"
 local apps = {}
 local selected = 1
 local firstVisible = 1
-local message = "Loading app catalog from the script host..."
+local message = ""
 local installedVersions = {}
 local themeIndex = 1
 local themes = {
@@ -21,6 +21,21 @@ local themes = {
     { accent = colors.orange, highlight = colors.red },
     { accent = colors.purple, highlight = colors.magenta },
 }
+
+local function displayPath(path)
+    local normalizedPath = tostring(path):gsub("^/+", "")
+    local systemPath = SYSTEM_APP_DIRECTORY:gsub("^/+", "")
+    if normalizedPath == systemPath then return "S://" end
+    if normalizedPath:sub(1, #systemPath + 1) == systemPath .. "/" then
+        return "S://" .. normalizedPath:sub(#systemPath + 1)
+    end
+    local normalizedHome = homeDirectory:gsub("^/+", ""):gsub("/+$", "")
+    if normalizedPath == normalizedHome then return "H://" end
+    if normalizedPath:sub(1, #normalizedHome + 1) == normalizedHome .. "/" then
+        return "H://" .. normalizedPath:sub(#normalizedHome + 2)
+    end
+    return tostring(path)
+end
 
 local function versionParts(version)
     if type(version) ~= "string" then return nil end
@@ -235,11 +250,6 @@ local function draw()
     term.setBackgroundColor(accent)
     term.write((" RIFT LAUNCHER // APP DOWNLOADER"):sub(1, width))
     term.setBackgroundColor(colors.black)
-    term.setCursorPos(2, 2)
-    term.setTextColor(colors.lightGray)
-    term.write(("Apps from self-hosted library  |  N/V: PAGE")
-        :sub(1, math.max(0, width - 2)))
-
     local lastVisible = math.min(#apps, firstVisible + visibleRows - 1)
     for index = firstVisible, lastVisible do
         local row = index - firstVisible + 3
@@ -305,7 +315,7 @@ local function confirmOverwrite(file)
     term.clear()
     term.setCursorPos(1, 1)
     term.setTextColor(colors.yellow)
-    print(file .. " already exists.")
+    print(displayPath(file) .. " already exists.")
     print("Replace it with the repository version? [y/N]")
     while true do
         local event, value = os.pullEventRaw()
@@ -536,7 +546,7 @@ local function downloadApp(app, skipOverwriteConfirmation)
         message = app.name .. " installed, but its version could not be saved: " .. versionError
         return
     end
-    message = app.name .. " v" .. app.version .. " installed as " .. destination .. "."
+    message = app.name .. " v" .. app.version .. " installed as " .. displayPath(destination) .. "."
 end
 
 local function updateApp(app)
@@ -590,7 +600,7 @@ local function uninstallApp(app)
     print("UNINSTALL " .. app.name)
     term.setTextColor(colors.white)
     print("This removes the app from " .. username .. "'s profile:")
-    print(destination)
+    print(displayPath(destination))
     print("Press Y to confirm or N/Escape to cancel.")
     while true do
         local event, key = os.pullEventRaw()

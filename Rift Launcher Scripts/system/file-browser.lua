@@ -3,6 +3,7 @@ local normalizedHome = type(requestedHome) == "string" and requestedHome:gsub("^
 local homeDirectory = normalizedHome and normalizedHome:match("^users/[%w_-]+$")
     and normalizedHome or "users/default"
 local username = homeDirectory:match("^users/([%w_-]+)$")
+local systemProgramsDirectory = ".launcher/apps"
 local privateDataDirectory = fs.combine(".launcher", "user-data", username)
 local shellDirectory = fs.combine(homeDirectory, "shell")
 local encryptionKeyPath = "/.launcher/.data-key"
@@ -18,7 +19,7 @@ fs.makeDir(shellDirectory)
 local entries = {}
 local selected = 1
 local firstVisible = 1
-local message = "Hold ALT to show hidden files and Private Data."
+local message = ""
 local clipboard
 local controlHeld = false
 local altHeld = false
@@ -150,6 +151,10 @@ end
 
 local function displayPath(path)
     local normalizedPath = path:gsub("^/+", "")
+    if normalizedPath == systemProgramsDirectory then return "S://" end
+    if isWithinRoot(normalizedPath, systemProgramsDirectory) then
+        return "S://" .. normalizedPath:sub(#systemProgramsDirectory + 2)
+    end
     local normalizedPrivateData = privateDataDirectory:gsub("^/+", "")
     if normalizedPath == normalizedPrivateData then return "H://[PRIVATE DATA]" end
     if isWithinRoot(normalizedPath, normalizedPrivateData) then
@@ -171,6 +176,11 @@ local function displayPath(path)
 end
 
 local function displayMessage(text)
+    local systemProgramsPattern = systemProgramsDirectory:gsub("([^%w])", "%%%1")
+    text = text:gsub("/" .. systemProgramsPattern .. "/", "S://")
+        :gsub("/" .. systemProgramsPattern, "S://")
+        :gsub(systemProgramsPattern .. "/", "S://")
+        :gsub(systemProgramsPattern, "S://")
     local privatePattern = privateDataDirectory:gsub("^/+", ""):gsub("([^%w])", "%%%1")
     text = text:gsub(privatePattern .. "/", "H://[PRIVATE DATA]/")
         :gsub(privatePattern, "H://[PRIVATE DATA]")
@@ -394,7 +404,7 @@ local function draw()
     term.setBackgroundColor(colors.black)
     term.setCursorPos(2, 2)
     term.setTextColor(colors.lightGray)
-    term.write(("Path: " .. displayPath(currentDirectory) .. "  |  N/V: PAGE")
+    term.write(("Path: " .. displayPath(currentDirectory))
         :sub(1, math.max(0, width - 2)))
 
     local lastVisible = math.min(#entries, firstVisible + rowCount - 1)
@@ -691,9 +701,6 @@ local function commandPrompt()
         term.setBackgroundColor(term.isColor() and themes[themeIndex].accent or colors.gray)
         term.write((" RIFT LAUNCHER // PROFILE COMMAND PROMPT"):sub(1, width))
         term.setBackgroundColor(colors.black)
-        writePromptLine("Only programs and files in your home directory are available.", colors.lightGray)
-        showPromptHelp()
-        writePromptLine("Enter a script filename or path directly, e.g. apps/market-client.lua.", colors.lightGray)
     end
     local function resolvePath(input)
         local path = resolveHomePath(workingDirectory, input)
@@ -1189,7 +1196,7 @@ local function commandPrompt()
     end
     loadTheme()
     refreshEntries()
-    message = "Returned from the profile command prompt."
+    message = ""
 end
 
 local function createFile()

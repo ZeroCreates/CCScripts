@@ -7,6 +7,16 @@ local ENCRYPTION_KEY_PATH = SYSTEM_DIRECTORY .. "/.data-key"
 local LAUNCHER_PATH = "/launcher.lua"
 local CLOUD_PROGRAM_PATH = SYSTEM_DIRECTORY .. "/apps/cloud.lua"
 local HOST_BASE_URL = "https://rift.zerocreates.org/"
+
+local function displaySystemPath(path)
+    local normalizedPath = tostring(path):gsub("^/+", "")
+    local launcherPath = LAUNCHER_PATH:gsub("^/+", "")
+    if normalizedPath == launcherPath then return "S://" .. launcherPath end
+    if normalizedPath:sub(1, #launcherPath + 1) == launcherPath .. "." then
+        return "S://" .. normalizedPath
+    end
+    return tostring(path)
+end
 local THEMES = {
     { name = "Ocean", accent = colors.cyan, highlight = colors.blue },
     { name = "Forest", accent = colors.lime, highlight = colors.green },
@@ -549,7 +559,7 @@ local function updateLauncher()
     if fs.exists(backup) then fs.delete(backup) end
     local file = fs.open(temporary, "w")
     if not file then
-        message = "Could not create " .. temporary .. "."
+        message = "Could not create " .. displaySystemPath(temporary) .. "."
         return
     end
     local wrote, writeError = pcall(file.write, contents)
@@ -829,9 +839,6 @@ local function draw()
             term.setTextColor(colors.lightGray)
             term.write("No user accounts exist.")
         end
-        term.setCursorPos(2, height - 3)
-        term.setTextColor(colors.lightGray)
-        term.write(("N/V: PAGE THROUGH USERS"):sub(1, math.max(0, width - 2)))
         term.setCursorPos(2, height - 2)
         term.setTextColor(colors.lightGray)
         term.write(message:sub(1, math.max(0, width - 2)))
