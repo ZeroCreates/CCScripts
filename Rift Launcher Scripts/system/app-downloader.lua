@@ -417,6 +417,12 @@ local function removeCatalogName(fileName)
     return true
 end
 
+local function prepareSystemDirectories()
+    fs.makeDir(SYSTEM_DIRECTORY)
+    fs.makeDir(SYSTEM_APP_DIRECTORY)
+    fs.makeDir(CACHE_DIRECTORY)
+end
+
 local function setHomeDirectory(path)
     if path == nil then path = USER_ROOT .. "default" end
     if type(path) ~= "string" then
@@ -430,9 +436,7 @@ local function setHomeDirectory(path)
     homeDirectory = "/users/" .. username
     appDirectory = homeDirectory .. "/apps"
     APP_NAMES_PATH = SYSTEM_DIRECTORY .. "/app-catalog-names.json"
-    fs.makeDir(SYSTEM_DIRECTORY)
-    fs.makeDir(SYSTEM_APP_DIRECTORY)
-    fs.makeDir(CACHE_DIRECTORY)
+    prepareSystemDirectories()
     local legacyNamesPath = homeDirectory .. "/.app-catalog-names.json"
     if fs.exists(legacyNamesPath) then
         local legacyFile = fs.open(legacyNamesPath, "r")
@@ -656,13 +660,20 @@ end
 
 local mode, target, requestedHome = ...
 if mode == "install-system" then
-    requestedHome = target
     target = nil
 elseif mode ~= "update" then
     requestedHome = mode
     mode = nil
 end
-local homeOk, homeError = setHomeDirectory(requestedHome)
+local homeOk, homeError
+if mode == "install-system" then
+    username = "system"
+    prepareSystemDirectories()
+    fs.makeDir(USER_ROOT)
+    homeOk = true
+else
+    homeOk, homeError = setHomeDirectory(requestedHome)
+end
 if not homeOk then
     printError(homeError)
     return
@@ -703,6 +714,29 @@ if mode == "install-system" then
     end
     if #failures > 0 then
         error("Some system apps could not be installed: " .. table.concat(failures, " "), 0)
+    end
+
+    local recoveryConsole
+    for _, app in ipairs(apps) do
+        if app.file == "lua-console.lua" and app.scope ~= "system" then
+            recoveryConsole = app
+            break
+        end
+    end
+    local recoveryConsoleFailure
+    if recoveryConsole then
+        local previousUsername, previousHome, previousApps = username, homeDirectory, appDirectory
+        username = "recovery"
+        homeDirectory = SYSTEM_DIRECTORY .. "/recovery"
+        appDirectory = fs.combine(homeDirectory, "apps")
+        local installed, installError = pcall(downloadApp, recoveryConsole, true)
+        local recoveryConsolePath = fs.combine(appDirectory, recoveryConsole.file)
+        if not installed or not fs.exists(recoveryConsolePath) then
+            recoveryConsoleFailure = tostring(not installed and installError or message)
+        end
+        username, homeDirectory, appDirectory = previousUsername, previousHome, previousApps
+    else
+        recoveryConsoleFailure = "Lua Console is missing from the app catalog."
     end
 
     local migrationFailures = {}
@@ -760,6 +794,9 @@ if mode == "install-system" then
                 error("Could not move old root app-downloader.lua: " .. tostring(moveError), 0)
             end
         end
+    end
+    if recoveryConsoleFailure then
+        error("Recovery Lua Console could not be installed: " .. recoveryConsoleFailure, 0)
     end
     print("Installed " .. installed .. " system app(s).")
     return

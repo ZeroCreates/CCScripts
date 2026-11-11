@@ -2,6 +2,7 @@
 local SYSTEM_APP_DIRECTORY = "/.launcher/apps"
 local DOWNLOADER_PATH = SYSTEM_APP_DIRECTORY .. "/app-downloader.lua"
 local SYSTEM_FILE_BROWSER_PATH = SYSTEM_APP_DIRECTORY .. "/file-browser.lua"
+local LUA_CONSOLE_PATH = "/.launcher/recovery/apps/lua-console.lua"
 local LEGACY_CLOUD_PATH = SYSTEM_APP_DIRECTORY .. "/cloud.lua"
 local SETTINGS_PROGRAM_PATH = SYSTEM_APP_DIRECTORY .. "/settings.lua"
 local HOST_BASE_URL = "https://rift.zerocreates.org/"
@@ -108,6 +109,7 @@ local firstVisible = 1
 local message = ""
 local currentUser
 local homeDirectory
+local recoverySession = false
 local profilePasswords = {}
 local profileAdmins = {}
 local authorizedProfiles = {}
@@ -674,7 +676,7 @@ local function drawBootScreen()
     local accent = term.isColor() and colors.cyan or colors.white
     local centerRow = math.max(1, math.floor(height / 2))
     local logo = {
-        "RRRR   III  FFFF  TTTTT",
+        " RRRR   III  FFFF  TTTTT",
         "R   R   I   F       T",
         "RRRR    I   FFF     T",
         "R R     I   F       T",
@@ -822,10 +824,10 @@ end
 local function recoveryMenu()
     local options = {
         { "Continue boot (skip update)", "continue" },
+        { "Sign in as Recovery Account", "recovery" },
         { "Retry update", "retry" },
         { "View boot log", "log" },
         { "Restore last good launcher", "restore" },
-        { "Open shell", "shell" },
         { "Reboot", "reboot" },
     }
     local choice, note = 1, ""
@@ -856,6 +858,9 @@ local function recoveryMenu()
                 if action == "continue" or action == "retry" then
                     bootLog("Recovery menu: " .. action)
                     return action
+                elseif action == "recovery" then
+                    bootLog("Recovery menu: recovery account selected")
+                    return action
                 elseif action == "log" then
                     viewBootLog()
                 elseif action == "restore" then
@@ -865,14 +870,6 @@ local function recoveryMenu()
                         while true do sleep(1) end
                     end
                     note = "No backup is available."
-                elseif action == "shell" then
-                    term.setBackgroundColor(colors.black)
-                    term.setTextColor(colors.white)
-                    term.clear()
-                    term.setCursorPos(1, 1)
-                    print("Recovery shell. Run 'reboot' to leave.")
-                    print("Log: edit " .. BOOT_LOG_PATH)
-                    pcall(nativeOs.run, _ENV, "/rom/programs/shell.lua")
                 else
                     nativeOs.reboot()
                     while true do sleep(1) end
@@ -883,6 +880,7 @@ local function recoveryMenu()
 end
 
 local skipLauncherUpdate = false
+local recoveryLoginRequested = false
 
 local function autoUpdateLauncher()
     drawBootScreen()
@@ -1622,7 +1620,7 @@ local function chooseUserPrompt(skipAutoLogin)
     local loadedAdmins, adminError = loadProfileAdmins()
     if not loadedAdmins then error(adminError, 0) end
     profileAdmins = loadedAdmins
-    if not skipAutoLogin and type(settings.autoLoginUser) == "string"
+    if not skipAutoLogin and settings.autoLoginUser ~= "default" and type(settings.autoLoginUser) == "string"
         and fs.isDir(fs.combine(USER_ROOT, settings.autoLoginUser)) then
         currentUser = settings.autoLoginUser
         homeDirectory = fs.combine(USER_ROOT, currentUser)
@@ -1676,7 +1674,7 @@ local function chooseUserPrompt(skipAutoLogin)
         end
         local path = fs.combine(USER_ROOT, username)
         if fs.exists(path) then
-            profileMessage = "That profile already exists. Select it from the list."
+            profileMessage = "That profile already exists. Choose another username."
             return false
         end
         write("Password: ")
@@ -1731,7 +1729,8 @@ local function chooseUserPrompt(skipAutoLogin)
     while true do
         local users = {}
         for _, entry in ipairs(fs.list(USER_ROOT)) do
-            if fs.isDir(fs.combine(USER_ROOT, entry)) and entry:match("^[%w_-]+$") then
+            if entry ~= "default" and fs.isDir(fs.combine(USER_ROOT, entry))
+                and entry:match("^[%w_-]+$") then
                 table.insert(users, entry)
             end
         end
@@ -1894,7 +1893,7 @@ local function listOtherProfiles(excludingUser)
     excludingUser = excludingUser or currentUser
     local profiles = {}
     for _, username in ipairs(fs.list(USER_ROOT)) do
-        if username ~= excludingUser and username:match("^[%w_-]+$")
+        if username ~= excludingUser and username ~= "default" and username:match("^[%w_-]+$")
             and fs.isDir(fs.combine(USER_ROOT, username)) then
             table.insert(profiles, username)
         end
@@ -1980,6 +1979,20 @@ local function loadCatalogNames()
 end
 
 local function refreshApps()
+    if recoverySession then
+        apps = {}
+        if fs.exists(SYSTEM_FILE_BROWSER_PATH) and not fs.isDir(SYSTEM_FILE_BROWSER_PATH) then
+            apps[#apps + 1] = { path = SYSTEM_FILE_BROWSER_PATH, name = "File Browser" }
+        end
+        local recoveryConsole = fs.combine(homeDirectory, "apps", "lua-console.lua")
+        if fs.exists(recoveryConsole) and not fs.isDir(recoveryConsole) then
+            apps[#apps + 1] = { path = recoveryConsole, name = "Lua Console" }
+        end
+        selected, firstVisible = 1, 1
+        if #apps == 0 then message = "System File Browser is not installed." end
+        return
+    end
+
     local available = {}
     local catalogNames = loadCatalogNames()
 
@@ -2144,16 +2157,24 @@ local function draw()
         term.setCursorPos(width, 3 + visibleRows)
         term.write("v")
     end
-    firstButtons = {
-        { label = "UPDATE", action = "update" },
-        { label = "SETTINGS", action = "settings" },
-    }
-    secondButtons = {
-        { label = "REFRESH", action = "refresh" },
-        { label = "ALERTS (" .. #notificationHistory .. ")", action = "alerts" },
-    }
-    if #tasks > 0 then
-        table.insert(secondButtons, { label = "TASKS (" .. #tasks .. ")", action = "tasks" })
+    if recoverySession then
+        firstButtons = { { label = "OPEN FILES", action = "open" } }
+        secondButtons = {
+            { label = "RECOVERY TOOLS", action = "recovery-tools" },
+            { label = "EXIT RECOVERY", action = "exit-recovery" },
+        }
+    else
+        firstButtons = {
+            { label = "UPDATE", action = "update" },
+            { label = "SETTINGS", action = "settings" },
+        }
+        secondButtons = {
+            { label = "REFRESH", action = "refresh" },
+            { label = "ALERTS (" .. #notificationHistory .. ")", action = "alerts" },
+        }
+        if #tasks > 0 then
+            table.insert(secondButtons, { label = "TASKS (" .. #tasks .. ")", action = "tasks" })
+        end
     end
     term.setCursorPos(1, height - 5)
     term.setTextColor(isColor and theme.accent or colors.gray)
@@ -2295,6 +2316,79 @@ end
 local function runHomeProgram(programPath, profileContext, ...)
     local homeDirectory = profileContext.homeDirectory
     local currentUser = profileContext.user
+    local recoveryRootAccess = profileContext.recovery == true
+    local recoveryProtectedPaths = {
+        ".launcher/profile-password.json",
+        ".launcher/profile-passwords.json",
+        ".launcher/.data-key",
+    }
+    local function isRecoveryProtectedPath(path)
+        if not recoveryRootAccess then return false end
+        local normalizedPath = tostring(path):gsub("^/+", ""):lower()
+        for _, protectedPath in ipairs(recoveryProtectedPaths) do
+            if normalizedPath == protectedPath
+                or normalizedPath:sub(1, #protectedPath + 1) == protectedPath .. "."
+                or normalizedPath:sub(1, #protectedPath + 1) == protectedPath .. "/" then
+                return true
+            end
+        end
+        return false
+    end
+    local function containsRecoveryProtectedPath(path)
+        if not recoveryRootAccess then return false end
+        local normalizedPath = tostring(path):gsub("^/+", ""):gsub("/+$", ""):lower()
+        if normalizedPath == "" then return true end
+        for _, protectedPath in ipairs(recoveryProtectedPaths) do
+            if protectedPath:sub(1, #normalizedPath + 1) == normalizedPath .. "/" then
+                return true
+            end
+        end
+        return false
+    end
+    local function getDriveMounts()
+        local mounts, driveNames = {}, {}
+        if type(peripheral) ~= "table" or type(peripheral.getNames) ~= "function" then
+            return mounts
+        end
+        for _, name in ipairs(peripheral.getNames()) do
+            local typeOk, peripheralType = pcall(peripheral.getType, name)
+            if typeOk and peripheralType == "drive" then driveNames[#driveNames + 1] = name end
+        end
+        if #driveNames == 0
+            or not riftModules.check("peripheral:drive", "your drive", riftModules.appName()) then
+            return mounts
+        end
+        for _, name in ipairs(driveNames) do
+                local wrapOk, drive = pcall(peripheral.wrap, name)
+                if wrapOk and drive and type(drive.getMountPath) == "function" then
+                    local mountOk, mountPath = pcall(drive.getMountPath)
+                    if mountOk and type(mountPath) == "string" then
+                        mountPath = mountPath:gsub("^/+", ""):gsub("/+$", "")
+                        if mountPath:match("^[%w_%-]+$") then
+                            mounts[#mounts + 1] = mountPath
+                        end
+                    end
+                end
+        end
+        table.sort(mounts, function(first, second) return first:lower() < second:lower() end)
+        return mounts
+    end
+
+    local function resolveProfilePath(username, profilePath)
+        if username == currentUser then
+            return nativeFs.combine(homeDirectory, profilePath)
+        end
+        if not recoveryRootAccess
+            and (type(profileContext.admins) ~= "table" or profileContext.admins[currentUser] ~= true) then
+            return nil
+        end
+        if not recoveryRootAccess then
+            local authorized, accessError = authorizeProfileAccess(username, profileContext)
+            if not authorized then return nil, accessError end
+        end
+        return nativeFs.combine(USER_ROOT, username, profilePath)
+    end
+
     local normalizedHome = homeDirectory:gsub("^/+", ""):gsub("/+$", "")
     local normalizedProgram = programPath:gsub("^/+", ""):gsub("/+$", "")
     local virtualProgram
@@ -2307,16 +2401,10 @@ local function runHomeProgram(programPath, profileContext, ...)
     end
 
     local virtualDirectory = ""
-    local function normalizeVirtualPath(path)
-        if type(path) ~= "string" then
-            error("Filesystem paths must be strings.", 0)
-        end
-
+    local function normalizeSegments(path, initialDirectory)
         local segments = {}
-        if path:sub(1, 1) ~= "/" and virtualDirectory ~= "" then
-            for segment in virtualDirectory:gmatch("[^/]+") do
-                table.insert(segments, segment)
-            end
+        for segment in (initialDirectory or ""):gmatch("[^/]+") do
+            table.insert(segments, segment)
         end
         for segment in path:gmatch("[^/]+") do
             if segment == ".." then
@@ -2328,14 +2416,60 @@ local function runHomeProgram(programPath, profileContext, ...)
         return table.concat(segments, "/")
     end
 
+    local function normalizeVirtualPath(path)
+        if type(path) ~= "string" then
+            error("Filesystem paths must be strings.", 0)
+        end
+        local alias, aliasPath = path:match("^([%w@#]+://)(.*)$")
+        if alias then return alias .. normalizeSegments(aliasPath) end
+        local initialDirectory = path:sub(1, 1) ~= "/" and virtualDirectory or ""
+        return normalizeSegments(path, initialDirectory)
+    end
+
     local function physicalPath(path)
         local normalizedPath = normalizeVirtualPath(path)
+        local alias, aliasPath = normalizedPath:match("^([%w@#]+://)(.*)$")
+        if alias == "H://" then
+            return nativeFs.combine(homeDirectory, aliasPath)
+        elseif alias == "ROOT://" then
+            if not recoveryRootAccess then return nil end
+            local target = aliasPath == "" and "/" or nativeFs.combine("/", aliasPath)
+            if isRecoveryProtectedPath(target) then error("This path is unavailable in recovery mode.", 0) end
+            return target
+        elseif alias == "S://" then
+            if not recoveryRootAccess then return nil end
+            local target = nativeFs.combine(SYSTEM_APP_DIRECTORY, aliasPath)
+            if isRecoveryProtectedPath(target) then error("This path is unavailable in recovery mode.", 0) end
+            return target
+        elseif alias then
+            local otherUsername = alias:match("^H@([%w_-]+)://$")
+            if otherUsername then
+                return resolveProfilePath(otherUsername, aliasPath)
+            end
+            local driveNumber = tonumber(alias:match("^D(%d+)://$"))
+            if driveNumber then
+                local mounts = getDriveMounts()
+                local mountPath = mounts[driveNumber]
+                if not mountPath then return nil end
+                return nativeFs.combine("/", mountPath, aliasPath)
+            end
+            return nil
+        end
+        if recoveryRootAccess then
+            if type(path) == "string" and path:sub(1, 1) == "/"
+                and (normalizedPath == "apps" or normalizedPath:sub(1, 5) == "apps/") then
+                return nativeFs.combine(homeDirectory, normalizedPath)
+            end
+            local target = normalizedPath == "" and "/" or nativeFs.combine("/", normalizedPath)
+            if isRecoveryProtectedPath(target) then
+                error("This path is unavailable in recovery mode.", 0)
+            end
+            return target
+        end
         if type(path) == "string" and path:sub(1, 1) == "/" then
             local username, profilePath = normalizedPath:match("^users/([%w_-]+)/*(.*)$")
             if username then
-                local authorized, accessError = authorizeProfileAccess(username, profileContext)
-                if not authorized then error(accessError, 0) end
-                return nativeFs.combine(USER_ROOT, username, profilePath)
+                return resolveProfilePath(username, profilePath)
             end
         end
         return nativeFs.combine(homeDirectory, normalizedPath)
@@ -2343,6 +2477,7 @@ local function runHomeProgram(programPath, profileContext, ...)
 
     local function virtualAbsolute(path)
         local normalized = normalizeVirtualPath(path)
+        if normalized:match("^[%w@#]+://") then return normalized end
         return normalized == "" and "/" or "/" .. normalized
     end
 
@@ -2565,10 +2700,19 @@ local function runHomeProgram(programPath, profileContext, ...)
             return virtualAbsolute(joined)
         end
         sandboxFs.getName = function(path)
-            return nativeFs.getName(normalizeVirtualPath(path))
+            if isRecoveryProtectedPath(path) then error("This path is unavailable in recovery mode.", 0) end
+            local target = physicalPath(path)
+            if not target then return nil end
+            return nativeFs.getName(target)
         end
         sandboxFs.getDir = function(path)
-            local directory = nativeFs.getDir(normalizeVirtualPath(path))
+            if isRecoveryProtectedPath(path) then error("This path is unavailable in recovery mode.", 0) end
+            local normalized = normalizeVirtualPath(path)
+            local alias, aliasPath = normalized:match("^([%w@#]+://)(.*)$")
+            local target = physicalPath(path)
+            if not target then return nil end
+            if alias then return alias .. nativeFs.getDir(aliasPath) end
+            local directory = nativeFs.getDir(normalized)
             return directory == "" and "/" or "/" .. directory
         end
 
@@ -2580,8 +2724,35 @@ local function runHomeProgram(programPath, profileContext, ...)
         for _, name in ipairs(pathFunctions) do
             if type(nativeFs[name]) == "function" then
                 local nativeFunction = nativeFs[name]
-                sandboxFs[name] = function(path, ...)
-                    return nativeFunction(physicalPath(path), ...)
+                if name == "list" then
+                    sandboxFs[name] = function(path, ...)
+                        local target = physicalPath(path)
+                        if not target then return nil end
+                        local entries = nativeFunction(target, ...)
+                        if not recoveryRootAccess then return entries end
+                        local visible = {}
+                        for _, entry in ipairs(entries) do
+                            if not isRecoveryProtectedPath(nativeFs.combine(target, entry)) then
+                                visible[#visible + 1] = entry
+                            end
+                        end
+                        return visible
+                    end
+                elseif name == "delete" then
+                    sandboxFs[name] = function(path, ...)
+                        local target = physicalPath(path)
+                        if not target then return nil end
+                        if containsRecoveryProtectedPath(target) then
+                            error("This location is unavailable in recovery mode.", 0)
+                        end
+                        return nativeFunction(target, ...)
+                    end
+                else
+                    sandboxFs[name] = function(path, ...)
+                        local target = physicalPath(path)
+                        if not target then return nil end
+                        return nativeFunction(target, ...)
+                    end
                 end
             end
         end
@@ -2589,7 +2760,14 @@ local function runHomeProgram(programPath, profileContext, ...)
             if type(nativeFs[name]) == "function" then
                 local nativeFunction = nativeFs[name]
                 sandboxFs[name] = function(source, destination, ...)
-                    return nativeFunction(physicalPath(source), physicalPath(destination), ...)
+                    local sourcePath = physicalPath(source)
+                    local destinationPath = physicalPath(destination)
+                    if not sourcePath or not destinationPath then return nil end
+                    if containsRecoveryProtectedPath(sourcePath)
+                        or containsRecoveryProtectedPath(destinationPath) then
+                        error("This location is unavailable in recovery mode.", 0)
+                    end
+                    return nativeFunction(sourcePath, destinationPath, ...)
                 end
             end
         end
@@ -2598,11 +2776,41 @@ local function runHomeProgram(programPath, profileContext, ...)
                 local results = {}
                 local physicalHome = nativeFs.combine(homeDirectory, "")
                 local normalizedPattern = normalizeVirtualPath(pattern)
+                local alias = normalizedPattern:match("^([%w@#]+://)")
+                if alias then
+                    local base = physicalPath(alias)
+                    local target = physicalPath(pattern)
+                    if not base or not target then return nil end
+                    local normalizedBase = base:gsub("^/+", ""):gsub("/+$", "")
+                    for _, found in ipairs(nativeFs.find(target)) do
+                        local normalizedFound = found:gsub("^/+", "")
+                        if not isRecoveryProtectedPath(found)
+                            and (normalizedFound == normalizedBase
+                                or normalizedFound:sub(1, #normalizedBase + 1) == normalizedBase .. "/") then
+                            local suffix = normalizedFound == normalizedBase and ""
+                                or normalizedFound:sub(#normalizedBase + 2)
+                            results[#results + 1] = alias .. suffix
+                        end
+                    end
+                    return results
+                end
+                if recoveryRootAccess then
+                    local target = physicalPath(pattern)
+                    if not target then return nil end
+                    for _, found in ipairs(nativeFs.find(target)) do
+                        if not isRecoveryProtectedPath(found) then
+                            results[#results + 1] = "/" .. found:gsub("^/+", "")
+                        end
+                    end
+                    return results
+                end
                 local targetUsername = normalizedPattern:match("^users/([%w_-]+)/")
                     or normalizedPattern:match("^users/([%w_-]+)$")
                 local physicalProfileRoot = targetUsername
                     and nativeFs.combine(USER_ROOT, targetUsername)
-                for _, found in ipairs(nativeFs.find(physicalPath(pattern))) do
+                local target = physicalPath(pattern)
+                if not target then return nil end
+                for _, found in ipairs(nativeFs.find(target)) do
                     local normalizedFound = found:gsub("^/+", "")
                     if normalizedFound == physicalHome then
                         table.insert(results, "/")
@@ -2619,13 +2827,22 @@ local function runHomeProgram(programPath, profileContext, ...)
         end
         if type(nativeFs.complete) == "function" then
             sandboxFs.complete = function(path, location, includeFiles, includeDirs)
-                local pathDirectory = nativeFs.getDir(path)
-                local name = nativeFs.getName(path)
-                local baseDirectory = path:sub(1, 1) == "/" and "/" or (location or virtualDirectory)
-                local completionDirectory = normalizeVirtualPath(
-                    baseDirectory .. (pathDirectory ~= "" and "/" .. pathDirectory or "")
-                )
-                local physicalDirectory = physicalPath("/" .. completionDirectory)
+                local normalized = normalizeVirtualPath(path)
+                local alias, aliasPath = normalized:match("^([%w@#]+://)(.*)$")
+                local pathForParts = alias and aliasPath or path
+                local pathDirectory = nativeFs.getDir(pathForParts)
+                local name = nativeFs.getName(pathForParts)
+                local baseDirectory
+                if alias then
+                    baseDirectory = alias .. pathDirectory
+                else
+                    baseDirectory = path:sub(1, 1) == "/" and "/" or (location or virtualDirectory)
+                    baseDirectory = normalizeVirtualPath(
+                        baseDirectory .. (pathDirectory ~= "" and "/" .. pathDirectory or "")
+                    )
+                end
+                local physicalDirectory = physicalPath(baseDirectory)
+                if not physicalDirectory then return nil end
                 local completions = nativeFs.complete(
                     name,
                     physicalDirectory,
@@ -2635,7 +2852,10 @@ local function runHomeProgram(programPath, profileContext, ...)
                 local prefix = pathDirectory ~= "" and pathDirectory .. "/" or ""
                 local result = {}
                 for _, completion in ipairs(completions) do
-                    table.insert(result, prefix .. completion)
+                    local completedPhysical = nativeFs.combine(physicalDirectory, completion)
+                    if not isRecoveryProtectedPath(completedPhysical) then
+                        table.insert(result, (alias or "") .. prefix .. completion)
+                    end
                 end
                 return result
             end
@@ -2936,6 +3156,7 @@ bgServices.launch = function(name, entry)
         passwords = profilePasswords,
         admins = profileAdmins,
         authorized = authorizedProfiles,
+        recovery = recoverySession,
     }
     bgServices.list[#bgServices.list + 1] = service
     bgServices.status[name] = "Running"
@@ -3104,6 +3325,34 @@ bgServices.remember = function(key, allowed)
     end
 end
 
+bgServices.clearUserServices = function(username)
+    bgServices.stopAll()
+    local serviceConfig = fs.combine(USER_ROOT, username, ".services.json")
+    if fs.exists(serviceConfig) then pcall(fs.delete, serviceConfig) end
+
+    local permissions = bgServices.permissions()
+    local servicePrefix = username .. ":"
+    local capabilityPrefix = servicePrefix .. "cap:"
+    local persistPrefix = "persist:" .. username .. ":"
+    local changed = false
+    for key in pairs(permissions) do
+        if key:sub(1, #persistPrefix) == persistPrefix
+            or key:sub(1, #servicePrefix) == servicePrefix
+                and key:sub(1, #capabilityPrefix) ~= capabilityPrefix then
+            permissions[key] = nil
+            changed = true
+        end
+    end
+    if changed then
+        pcall(fs.makeDir, SYSTEM_DIRECTORY .. "/system")
+        local handle = fs.open(bgServices.permissionPath, "w")
+        if handle then
+            handle.write(textutils.serializeJSON(permissions))
+            handle.close()
+        end
+    end
+end
+
 -- Draws a Y/A/N/D permission box over the screen and returns "once", "always", "no" or "never".
 bgServices.prompt = function(lines)
     local screen = term.native()
@@ -3155,6 +3404,7 @@ end
 
 -- Asks the user to allow a background service. Returns true or false.
 bgServices.ask = function(name, displayName, persist)
+    if recoverySession then return false end
     local key = tostring(currentUser) .. ":" .. name
     local saved = bgServices.permissions()[key]
     if saved ~= nil then return saved == true end
@@ -3645,6 +3895,7 @@ bgServices.api = {
     -- reboot the launcher runs the app hidden; when the run reaches this call the launcher starts the
     -- registered function as the service and discards the hidden run, so the rest never executes.
     persistInit = function(name, fn, options)
+        if recoverySession then return false, "Background services are disabled in recovery mode." end
         if type(name) ~= "string" or not name:match("^[%w_.-]+$") or #name > 32 then
             error("Service names use letters, digits, _ . - and at most 32 characters.", 2)
         end
@@ -3670,6 +3921,7 @@ bgServices.api = {
     -- spawn("name" [, function() ... end] [, options]): the app registers and starts the service.
     -- With a persistInit endpoint for this name the service is also restored after every reboot.
     spawn = function(name, fn, options)
+        if recoverySession then return false, "Background services are disabled in recovery mode." end
         if type(name) ~= "string" or not name:match("^[%w_.-]+$") or #name > 32 then
             error("Service names use letters, digits, _ . - and at most 32 characters.", 2)
         end
@@ -3701,6 +3953,7 @@ bgServices.api = {
     end,
     -- install("name", "/apps/sync.lua", { displayName, description, startType, recovery })
     install = function(name, path, options)
+        if recoverySession then return false, "Background services are disabled in recovery mode." end
         options = type(options) == "table" and options or {}
         if type(name) ~= "string" or not name:match("^[%w_.-]+$") or #name > 32 then
             error("Service names use letters, digits, _ . - and at most 32 characters.", 2)
@@ -3738,6 +3991,7 @@ bgServices.api = {
         return bgServices.save(config)
     end,
     start = function(name)
+        if recoverySession then return false, "Background services are disabled in recovery mode." end
         local entry = bgServices.load()[name]
         if not entry then return false, "No such service." end
         if entry.startType == "disabled" then return false, "Service is disabled." end
@@ -3759,11 +4013,13 @@ bgServices.api = {
     end,
     -- Returns "Running", "Stopped" or "Failed: reason".
     status = function(name)
+        if recoverySession then return nil end
         if bgServices.find(name) then return "Running" end
         if not bgServices.load()[name] and not bgServices.status[name] then return nil end
         return bgServices.status[name] or "Stopped"
     end,
     list = function()
+        if recoverySession then return {} end
         local result = {}
         for name, entry in pairs(bgServices.load()) do
             result[#result + 1] = {
@@ -3865,7 +4121,7 @@ showSessionMenu = function(inProgram)
                 options[#options + 1] = { label, "task", task = task }
             end
             options[#options + 1] = { "Session  >", "session_menu" }
-            if showServices then
+            if showServices and not recoverySession then
                 options[#options + 1] = { "Services  >", "services_menu" }
             end
             options[#options + 1] = { "Exit Menu", "exit" }
@@ -4147,7 +4403,7 @@ local function launchSelected()
             return authorizeProfileAccess(username, profileContext)
         end
         ok, result = protectedRun(nativeOs.run, createSystemEnvironment(), app.path, profileContext.homeDirectory,
-            runProfileProgram, listLaunchProfiles, authorizeLaunchProfile)
+            runProfileProgram, listLaunchProfiles, authorizeLaunchProfile, recoverySession)
     elseif app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "") then
         local environment = createSystemEnvironment()
         environment.profileHomeDirectory = homeDirectory
@@ -4252,6 +4508,7 @@ local function applySessionAction(action)
         end
     elseif action == "switch_user" then
         if chooseUser() then
+            recoverySession = false
             killAllTasks()
             selected = 1
             firstVisible = 1
@@ -4261,6 +4518,7 @@ local function applySessionAction(action)
         end
     elseif action == "logout" then
         killAllTasks()
+        recoverySession = false
         currentUser = nil
         homeDirectory = nil
         authorizedProfiles = {}
@@ -4273,59 +4531,266 @@ local function applySessionAction(action)
     end
 end
 
-local function launcherMain()
-bootLog("---- BOOT launcher " .. tostring(fs.exists(LAUNCHER_PATH) and fs.getSize(LAUNCHER_PATH))
-    .. " bytes; free=" .. tostring(fs.getFreeSpace("/")) .. "; http=" .. tostring(http ~= nil)
-    .. "; pending=" .. tostring(fs.exists(PENDING_BOOT_PATH)) .. "; good=" .. tostring(fs.exists(GOOD_LAUNCHER_PATH))
-    .. "; bad=" .. tostring(fs.exists(BAD_LAUNCHER_PATH)))
-local recoveryRequested = bootRecoveryRequested()
-if recoveryRequested then bootLog("Recovery menu opened (R held)") end
-if recoverFromFailedUpdate() then skipLauncherUpdate = true end
-if recoveryRequested then
-    skipLauncherUpdate = recoveryMenu() == "continue"
-end
-startBootPhase()
-local migrateLegacySettings = not fs.exists(SETTINGS_PATH) and fs.exists(LEGACY_SETTINGS_PATH)
-local keyReady, keyError = ensureEncryptionKey()
-if not keyReady then error(keyError, 0) end
-loadSettings()
-if settingsProtectionError then error(settingsProtectionError, 0) end
-applyTheme()
-local _, startupError = ensureStartupProgram()
-if migrateLegacySettings or settingsNeedEncryption then
-    if not saveSettings() then
-        error("Could not encrypt existing launcher settings: " .. message, 0)
+local bootFlow = {}
+
+bootFlow.handleRecovery = function()
+    bootLog("---- BOOT launcher " .. tostring(fs.exists(LAUNCHER_PATH) and fs.getSize(LAUNCHER_PATH))
+        .. " bytes; free=" .. tostring(fs.getFreeSpace("/")) .. "; http=" .. tostring(http ~= nil)
+        .. "; pending=" .. tostring(fs.exists(PENDING_BOOT_PATH)) .. "; good=" .. tostring(fs.exists(GOOD_LAUNCHER_PATH))
+        .. "; bad=" .. tostring(fs.exists(BAD_LAUNCHER_PATH)))
+    local recoveryRequested = bootRecoveryRequested()
+    if recoveryRequested then bootLog("Recovery menu opened (R held)") end
+    if recoverFromFailedUpdate() then skipLauncherUpdate = true end
+    if recoveryRequested then
+        local choice = recoveryMenu()
+        skipLauncherUpdate = choice == "continue" or choice == "recovery"
+        recoveryLoginRequested = choice == "recovery"
     end
-    if migrateLegacySettings then fs.delete(LEGACY_SETTINGS_PATH) end
+    startBootPhase()
 end
 
-local downloaderReady, downloaderError = installDownloader()
-bootLog("Downloader ready=" .. tostring(downloaderReady) .. (downloaderError and (" error=" .. tostring(downloaderError)) or ""))
-if fs.exists(LEGACY_CLOUD_PATH) then pcall(fs.delete, LEGACY_CLOUD_PATH) end
-startBootPhase()
-autoUpdateLauncher()
+bootFlow.loadSettings = function()
+    local migrateLegacySettings = not fs.exists(SETTINGS_PATH) and fs.exists(LEGACY_SETTINGS_PATH)
+    local keyReady, keyError = ensureEncryptionKey()
+    if not keyReady then error(keyError, 0) end
+    loadSettings()
+    if settingsProtectionError then error(settingsProtectionError, 0) end
+    applyTheme()
+    local _, startupError = ensureStartupProgram()
+    if migrateLegacySettings or settingsNeedEncryption then
+        if not saveSettings() then
+            error("Could not encrypt existing launcher settings: " .. message, 0)
+        end
+        if migrateLegacySettings then fs.delete(LEGACY_SETTINGS_PATH) end
+    end
+    return startupError
+end
 
-startBootPhase()
-chooseUser()
-bootLog("Signed in: " .. tostring(currentUser))
-local systemAppInstallMessage
-if downloaderReady then
-    local installer, loadError = loadfile(DOWNLOADER_PATH, "t", _ENV)
-    if not installer then
-        systemAppInstallMessage = "System app installer is broken: " .. tostring(loadError)
-    else
-        local ok, result = pcall(installer, "install-system", homeDirectory)
-        if not ok then
-            systemAppInstallMessage = "System app install failed: " .. tostring(result)
+bootFlow.prepareLauncherUpdate = function()
+    local downloaderReady, downloaderError = installDownloader()
+    bootLog("Downloader ready=" .. tostring(downloaderReady) .. (downloaderError and (" error=" .. tostring(downloaderError)) or ""))
+    if fs.exists(LEGACY_CLOUD_PATH) then pcall(fs.delete, LEGACY_CLOUD_PATH) end
+    startBootPhase()
+    autoUpdateLauncher()
+
+    startBootPhase()
+    return downloaderReady, downloaderError
+end
+
+bootFlow.signIn = function()
+    if recoveryLoginRequested then
+        local passwords, passwordError = loadProfilePasswords()
+        if not passwords then error(passwordError, 0) end
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.setTextColor(colors.cyan)
+        print("RECOVERY ACCOUNT")
+        term.setTextColor(colors.white)
+        local existingPassword = passwords.default
+        local authenticated
+        if existingPassword == nil then
+            print("Set a password for the recovery account.")
+            write("New password: ")
+            local newPassword = readPassword()
+            if newPassword == "" then
+                message = "Recovery password cannot be empty."
+            else
+                write("Confirm password: ")
+                if readPassword() ~= newPassword then
+                    message = "Recovery passwords did not match."
+                else
+                    passwords.default = newPassword
+                    local saved, saveError = saveProfilePasswords(passwords)
+                    if saved then
+                        profilePasswords = passwords
+                        authenticated = true
+                    else
+                        passwords.default = nil
+                        message = "Could not save recovery password: " .. tostring(saveError)
+                    end
+                end
+            end
+        elseif existingPassword ~= "" then
+            write("Password: ")
+            authenticated = readPassword() == existingPassword
+            if not authenticated then message = "Recovery authentication failed. Sign in with a user account." end
+        else
+            message = "The recovery password is invalid. Sign in with a user account."
+        end
+        if authenticated then
+            local admins, adminError = loadProfileAdmins()
+            if not admins then error(adminError, 0) end
+            profileAdmins = admins
+            profileAdmins.default = true
+            currentUser = "default"
+            homeDirectory = fs.combine(USER_ROOT, currentUser)
+            local made, makeError = pcall(fs.makeDir, homeDirectory)
+            if not made then error("Could not prepare the recovery profile: " .. tostring(makeError), 0) end
+            local recoveryAppsDirectory = fs.combine(homeDirectory, "apps")
+            local appsMade = pcall(fs.makeDir, recoveryAppsDirectory)
+            local recoveryConsole = fs.combine(recoveryAppsDirectory, "lua-console.lua")
+            if appsMade and not fs.exists(recoveryConsole) and fs.exists(LUA_CONSOLE_PATH) then
+                pcall(fs.copy, LUA_CONSOLE_PATH, recoveryConsole)
+            end
+            authorizedProfiles = {}
+            for _, username in ipairs(fs.list(USER_ROOT)) do
+                if username ~= "default" and username:match("^[%w_-]+$")
+                    and fs.isDir(fs.combine(USER_ROOT, username)) then
+                    authorizedProfiles[username] = true
+                end
+            end
+            recoverySession = true
+            bgServices.clearUserServices(currentUser)
+            bootLog("Signed in: default (recovery)")
+            return
         end
     end
-else
-    systemAppInstallMessage = "Could not prepare the system app installer: " .. tostring(downloaderError)
+    chooseUser()
+    bootLog("Signed in: " .. tostring(currentUser))
 end
-if fs.exists(PENDING_BOOT_PATH) then fs.delete(PENDING_BOOT_PATH) end
-bootLog("Boot complete; update marker cleared")
-bgServices.startAutomatic()
-if systemAppInstallMessage then bootLog(systemAppInstallMessage) end
+
+bootFlow.installSystemApps = function(downloaderReady, downloaderError)
+    local systemAppInstallMessage
+    if downloaderReady then
+        local installer, loadError = loadfile(DOWNLOADER_PATH, "t", _ENV)
+        if not installer then
+            systemAppInstallMessage = "System app installer is broken: " .. tostring(loadError)
+        else
+            local ok, result = pcall(installer, "install-system")
+            if not ok then
+                systemAppInstallMessage = "System app install failed: " .. tostring(result)
+            end
+        end
+    else
+        systemAppInstallMessage = "Could not prepare the system app installer: " .. tostring(downloaderError)
+    end
+    return systemAppInstallMessage
+end
+
+bootFlow.completeBoot = function(systemAppInstallMessage)
+    if fs.exists(PENDING_BOOT_PATH) then fs.delete(PENDING_BOOT_PATH) end
+    bootLog("Boot complete; update marker cleared")
+    if not recoverySession then bgServices.startAutomatic() end
+    if systemAppInstallMessage then bootLog(systemAppInstallMessage) end
+end
+
+local function recoveryToolsMenu()
+    local options = {
+        { label = "Update launcher", action = "update" },
+        { label = "Wipe computer", action = "wipe" },
+        { label = "Back", action = "back" },
+    }
+    local selected = 1
+    while true do
+        local width, height = term.getSize()
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.clear()
+        term.setCursorPos(2, 2)
+        term.setTextColor(term.isColor() and colors.cyan or colors.white)
+        term.write("RECOVERY TOOLS")
+        for index, option in ipairs(options) do
+            term.setCursorPos(2, index + 4)
+            term.setTextColor(index == selected and colors.white or colors.lightGray)
+            term.write((index == selected and "> " or "  ") .. option.label)
+        end
+        term.setCursorPos(2, height)
+        term.setTextColor(colors.lightGray)
+        term.write("Up/Down Enter   Esc Back")
+        local event, button, x, y = nativePullEventRaw()
+        if event == "key" then
+            if button == keys.up then
+                selected = selected == 1 and #options or selected - 1
+            elseif button == keys.down then
+                selected = selected == #options and 1 or selected + 1
+            elseif button == keys.enter or button == keys.numPadEnter then
+                return options[selected].action
+            elseif button == keys.escape then
+                return "back"
+            end
+        elseif event == "mouse_click" and button == 1 then
+            local index = y - 4
+            if x >= 2 and x <= math.min(width, 30) and options[index] then
+                return options[index].action
+            end
+        end
+    end
+end
+
+local function wipeRecoveryComputer()
+    local width, height = term.getSize()
+    local buttons = {
+        { label = "CANCEL", action = false },
+        { label = "WIPE COMPUTER", action = true },
+    }
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+    term.setTextColor(colors.red)
+    print("WIPE COMPUTER")
+    term.setTextColor(colors.white)
+    print("This permanently deletes every file and folder")
+    print("on this computer, except the ROM folder.")
+    print("Confirm only if you intend to erase this computer.")
+    drawButtons(buttons, height - 1, width, term.isColor())
+
+    local confirmed
+    while confirmed == nil do
+        local event, key, x, y = nativePullEventRaw()
+        if event == "key" and (key == keys.escape or key == keys.n) then
+            confirmed = false
+        elseif event == "key" and key == keys.y then
+            confirmed = true
+        elseif event == "mouse_click" and key == 1 and y == height - 1 then
+            confirmed = buttonAt(buttons, x)
+        end
+    end
+    if not confirmed then
+        message = "Computer wipe cancelled."
+        return
+    end
+
+    local failures = {}
+    for _, entry in ipairs(fs.list("/")) do
+        if entry:lower() ~= "rom" then
+            local path = fs.combine("/", entry)
+            local removed, removeError = pcall(fs.delete, path)
+            if not removed or fs.exists(path) then
+                failures[#failures + 1] = path .. ": " .. tostring(removeError or "could not remove")
+            end
+        end
+    end
+
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+    if #failures > 0 then
+        term.setTextColor(colors.red)
+        print("Computer wipe was incomplete:")
+        for _, failure in ipairs(failures) do print(failure) end
+        print("Press any key to return to recovery.")
+        nativePullEventRaw()
+        message = "Computer wipe was incomplete; see the error list."
+        return
+    end
+
+    term.setTextColor(colors.lime)
+    print("Computer filesystem wiped.")
+    print("The ROM folder was preserved. Turn off or reboot the computer.")
+    while true do nativePullEventRaw() end
+end
+
+local function launcherMain()
+bootFlow.handleRecovery()
+local startupError = bootFlow.loadSettings()
+local downloaderReady, downloaderError = bootFlow.prepareLauncherUpdate()
+local systemAppInstallMessage = bootFlow.installSystemApps(downloaderReady, downloaderError)
+bootFlow.signIn()
+bootFlow.completeBoot(systemAppInstallMessage)
 
 refreshApps()
 if startupError and systemAppInstallMessage then
@@ -4336,7 +4801,7 @@ elseif systemAppInstallMessage then
     message = systemAppInstallMessage
 end
 
-if settings.autoLaunchPath then
+if settings.autoLaunchPath and not recoverySession then
     local autoLaunchIndex
     for index, app in ipairs(apps) do
         if app.path == settings.autoLaunchPath then
@@ -4407,6 +4872,25 @@ while true do
                 local choice = showSessionMenu(false)
                 if choice == "switch_task" or choice == "switch_user" or choice == "logout" then
                     applySessionAction(choice)
+                end
+            elseif action == "exit-recovery" then
+                killAllTasks()
+                recoverySession = false
+                currentUser = nil
+                homeDirectory = nil
+                authorizedProfiles = {}
+                chooseUser(true)
+                selected, firstVisible = 1, 1
+                refreshApps()
+            elseif action == "recovery-tools" then
+                local choice = recoveryToolsMenu()
+                if choice == "update" then
+                    local previousSkip = skipLauncherUpdate
+                    skipLauncherUpdate = false
+                    autoUpdateLauncher()
+                    skipLauncherUpdate = previousSkip
+                elseif choice == "wipe" then
+                    wipeRecoveryComputer()
                 end
             end
         end

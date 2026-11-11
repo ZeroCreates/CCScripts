@@ -1,8 +1,9 @@
-local requestedHome, runProfileProgram, listOtherProfiles, authorizeProfileAccess = ...
+local requestedHome, runProfileProgram, listOtherProfiles, authorizeProfileAccess, recoveryMode = ...
 local normalizedHome = type(requestedHome) == "string" and requestedHome:gsub("^/+", "")
 local homeDirectory = normalizedHome and normalizedHome:match("^users/[%w_-]+$")
     and normalizedHome or "users/default"
 local username = homeDirectory:match("^users/([%w_-]+)$")
+recoveryMode = recoveryMode == true and username == "default"
 local systemProgramsDirectory = ".launcher/apps"
 local privateDataDirectory = fs.combine(".launcher", "user-data", username)
 local shellDirectory = fs.combine(homeDirectory, "shell")
@@ -56,7 +57,39 @@ local function loadTheme()
 end
 
 local function isWithinRoot(path, root)
+    if root == "/" then return true end
     return path == root or path:sub(1, #root + 1) == root .. "/"
+end
+
+local recoveryProtectedPaths = {
+    ".launcher/profile-password.json",
+    ".launcher/profile-passwords.json",
+    ".launcher/.data-key",
+}
+
+local function isRecoveryProtectedPath(path)
+    if not recoveryMode then return false end
+    local normalizedPath = tostring(path):gsub("^/+", ""):lower()
+    for _, protectedPath in ipairs(recoveryProtectedPaths) do
+        if normalizedPath == protectedPath
+            or normalizedPath:sub(1, #protectedPath + 1) == protectedPath .. "."
+            or normalizedPath:sub(1, #protectedPath + 1) == protectedPath .. "/" then
+            return true
+        end
+    end
+    return false
+end
+
+local function containsRecoveryProtectedPath(path)
+    if not recoveryMode then return false end
+    local normalizedPath = tostring(path):gsub("^/+", ""):gsub("/+$", ""):lower()
+    if normalizedPath == "" then return false end
+    for _, protectedPath in ipairs(recoveryProtectedPaths) do
+        if protectedPath:sub(1, #normalizedPath + 1) == normalizedPath .. "/" then
+            return true
+        end
+    end
+    return false
 end
 
 local function isPrivateDataPath(path)
@@ -154,15 +187,23 @@ local function deleteFile(path)
 end
 
 local function displayPath(path)
-    local normalizedPath = path:gsub("^/+", "")
+    local originalPath = tostring(path)
+    local normalizedPath = originalPath:gsub("^/+", ""):gsub("/+$", "")
+    if normalizedPath == "" then return "ROOT://" end
     if normalizedPath == systemProgramsDirectory then return "S://" end
     if isWithinRoot(normalizedPath, systemProgramsDirectory) then
         return "S://" .. normalizedPath:sub(#systemProgramsDirectory + 2)
     end
     local normalizedPrivateData = privateDataDirectory:gsub("^/+", "")
-    if normalizedPath == normalizedPrivateData then return "H://[PRIVATE DATA]" end
+    if normalizedPath == normalizedPrivateData then return "PD://" end
     if isWithinRoot(normalizedPath, normalizedPrivateData) then
-        return "H://[PRIVATE DATA]/" .. normalizedPath:sub(#normalizedPrivateData + 2)
+        return "PD://" .. normalizedPath:sub(#normalizedPrivateData + 2)
+    end
+    for index, mount in ipairs(diskMounts) do
+        if normalizedPath == mount.path then return "D" .. index .. "://" end
+        if isWithinRoot(normalizedPath, mount.path) then
+            return "D" .. index .. "://" .. normalizedPath:sub(#mount.path + 2)
+        end
     end
     if authorizedProfileRoot and isWithinRoot(normalizedPath, authorizedProfileRoot) then
         local username = authorizedProfileRoot:match("^users/([%w_-]+)$")
@@ -176,28 +217,50 @@ local function displayPath(path)
     if isWithinRoot(normalizedPath, homeDirectory) then
         return "H://" .. normalizedPath:sub(#homeDirectory + 2)
     end
+    if originalPath:sub(1, 1) == "/" then return "ROOT://" .. normalizedPath end
     return path
 end
 
 local function displayMessage(text)
-    local systemProgramsPattern = systemProgramsDirectory:gsub("([^%w])", "%%%1")
-    text = text:gsub("/" .. systemProgramsPattern .. "/", "S://")
-        :gsub("/" .. systemProgramsPattern, "S://")
-        :gsub(systemProgramsPattern .. "/", "S://")
-        :gsub(systemProgramsPattern, "S://")
-    local privatePattern = privateDataDirectory:gsub("^/+", ""):gsub("([^%w])", "%%%1")
-    text = text:gsub(privatePattern .. "/", "H://[PRIVATE DATA]/")
-        :gsub(privatePattern, "H://[PRIVATE DATA]")
+    text = tostring(text)
+    local function replacePath(path, alias)
+        local normalized = tostring(path):gsub("^/+", ""):gsub("/+$", "")
+        if normalized == "" then return end
+        local pattern = normalized:gsub("([^%w])", "%%%1")
+        text = text:gsub("/" .. pattern .. "/", alias)
+            :gsub("/" .. pattern .. "%f[%W]", alias)
+            :gsub("^" .. pattern .. "/", alias)
+            :gsub("([%s%(])" .. pattern .. "/", "%1" .. alias)
+            :gsub("([%s%(])" .. pattern .. "%f[%W]", "%1" .. alias)
+    end
+
+    replacePath(privateDataDirectory, "PD://")
     if authorizedProfileRoot then
         local username = authorizedProfileRoot:match("^users/([%w_-]+)$")
         if username then
-            local profilePattern = authorizedProfileRoot:gsub("([^%w])", "%%%1")
-            text = text:gsub(profilePattern .. "/", "H@" .. username .. "://")
-                :gsub(profilePattern, "H@" .. username .. "://")
+            replacePath(authorizedProfileRoot, "H@" .. username .. "://")
         end
     end
-    local homePattern = homeDirectory:gsub("([^%w])", "%%%1")
-    return (text:gsub(homePattern .. "/", "H://"):gsub(homePattern, "H://"))
+    replacePath(systemProgramsDirectory, "S://")
+    replacePath(homeDirectory, "H://")
+    for index, mount in ipairs(diskMounts) do
+        replacePath(mount.path, "D" .. index .. "://")
+    end
+    local function replaceAbsolutePath(prefix, path)
+        local suffix = ""
+        while path:match("[.,;!?%)%]]$") do
+            suffix = path:sub(-1) .. suffix
+            path = path:sub(1, -2)
+        end
+        return prefix .. displayPath(path) .. suffix
+    end
+    text = text:gsub("^(/[^%s]+)", function(path)
+        return replaceAbsolutePath("", path)
+    end)
+    text = text:gsub("([%s%(])(/[^%s]+)", function(prefix, path)
+        return replaceAbsolutePath(prefix, path)
+    end)
+    return text
 end
 
 local function refreshDiskMounts()
@@ -247,6 +310,7 @@ local function refreshEntries()
     refreshDiskMounts()
     if currentRoot ~= homeDirectory and currentRoot ~= profilesDirectory
         and currentRoot ~= authorizedProfileRoot and currentRoot ~= privateDataDirectory
+        and not (recoveryMode and currentRoot == "/")
         and not isMountedDisk(currentRoot) then
         currentDirectory = homeDirectory
         currentRoot = homeDirectory
@@ -277,6 +341,7 @@ local function refreshEntries()
                 end
             end
         end
+    elseif currentRoot == "/" then
     elseif currentRoot ~= homeDirectory then
         table.insert(updated, {
             name = "..",
@@ -285,6 +350,14 @@ local function refreshEntries()
             returnHome = true,
         })
     else
+        if recoveryMode then
+            table.insert(updated, {
+                name = "[Main Directory]",
+                path = "/",
+                isDirectory = true,
+                mainRoot = true,
+            })
+        end
         table.insert(updated, {
             name = "[Other Users]",
             path = profilesDirectory,
@@ -293,7 +366,7 @@ local function refreshEntries()
         })
         for _, mount in ipairs(diskMounts) do
             table.insert(updated, {
-                name = "[Disk] " .. mount.path,
+                name = displayPath(mount.path),
                 path = mount.path,
                 isDirectory = true,
                 diskRoot = true,
@@ -312,8 +385,8 @@ local function refreshEntries()
 
     if currentRoot ~= profilesDirectory then
         for _, name in ipairs(fs.list(currentDirectory)) do
-            if altHeld or name:sub(1, 1) ~= "." then
-                local path = fs.combine(currentDirectory, name)
+            local path = fs.combine(currentDirectory, name)
+            if (altHeld or name:sub(1, 1) ~= ".") and not isRecoveryProtectedPath(path) then
                 table.insert(updated, {
                     name = name,
                     path = path,
@@ -374,11 +447,26 @@ local function draw()
     local selectedEntry = entries[selected]
     if selectedEntry and not selectedEntry.isDirectory
         and selectedEntry.path:lower():match("%.lua$")
-        and isWithinRoot(selectedEntry.path, homeDirectory) then
+        and isWithinRoot(selectedEntry.path, homeDirectory) and not recoveryMode then
         table.insert(topButtons, { label = "RUN", action = "run" })
     end
     local bottomButtons
-    if currentDirectory == homeDirectory then
+    if recoveryMode and currentDirectory == homeDirectory then
+        bottomButtons = {
+            { label = "HOME", action = "home" },
+            { label = "DELETE", action = "delete" },
+            { label = "CMD", action = "command" },
+            { label = "EXIT", action = "exit" },
+        }
+    elseif recoveryMode then
+        bottomButtons = {
+            { label = "UP", action = "up" },
+            { label = "HOME", action = "home" },
+            { label = "DELETE", action = "delete" },
+            { label = "CMD", action = "command" },
+            { label = "EXIT", action = "exit" },
+        }
+    elseif currentDirectory == homeDirectory then
         bottomButtons = {
             { label = "HOME", action = "home" },
             { label = "DELETE", action = "delete" },
@@ -453,6 +541,10 @@ local function editSelected()
         message = "That file is outside the current location."
         return
     end
+    if isRecoveryProtectedPath(entry.path) then
+        message = "That file is unavailable in recovery mode."
+        return
+    end
 
     local editorPath = shell.resolveProgram("edit")
     if not editorPath then
@@ -460,7 +552,22 @@ local function editSelected()
         return
     end
 
-    if isPrivateDataPath(entry.path) then
+    local privateData = isPrivateDataPath(entry.path)
+    local detectionFile = fs.open(entry.path, "r")
+    if not detectionFile then
+        message = "Could not open the selected file."
+        return
+    end
+    local readOk, prefix = pcall(detectionFile.read, 9)
+    local closeOk, closeError = pcall(detectionFile.close)
+    if not readOk or not closeOk then
+        message = "Could not inspect the selected file: "
+            .. tostring(not readOk and prefix or closeError)
+        return
+    end
+    local encryptedFile = prefix == "CCLOCAL1:"
+
+    if privateData or encryptedFile then
         local keyBytes, keyError = loadEncryptionKey()
         if not keyBytes then
             message = keyError
@@ -473,10 +580,11 @@ local function editSelected()
         end
         local plaintext, wasEncrypted, decryptError = decryptPrivateData(encryptedContents, keyBytes)
         if not plaintext then
-            message = "Could not decrypt private data: " .. tostring(decryptError)
+            message = (privateData and "Could not decrypt private data: "
+                or "Could not decrypt encrypted file: ") .. tostring(decryptError)
             return
         end
-        if wasEncrypted then
+        if privateData and wasEncrypted then
             local decoded, value = pcall(textutils.unserializeJSON, plaintext)
             if not decoded or (value == nil and plaintext ~= "null") then
                 message = "Could not decode this private data with the local key. "
@@ -540,7 +648,7 @@ local function editSelected()
         end
         if not restoredDirectory then
             message = "Could not restore the previous directory: " .. tostring(restoreError)
-                .. ". The original private data remains encrypted; plaintext is at "
+                .. ". The original remains encrypted; plaintext is at "
                 .. temporaryPath .. "."
             return
         end
@@ -555,7 +663,7 @@ local function editSelected()
         local encryptedTemporary = entry.path .. ".enc-tmp"
         local backup = entry.path .. ".enc-bak"
         if fs.exists(encryptedTemporary) or fs.exists(backup) then
-            message = "Could not re-encrypt private data: a recovery file already exists. "
+            message = "Could not re-encrypt the file: a recovery file already exists. "
                 .. "Plaintext remains at " .. temporaryPath .. "."
             return
         end
@@ -569,7 +677,7 @@ local function editSelected()
         local backedUp, backupError = pcall(fs.move, entry.path, backup)
         if not backedUp then
             deleteFile(encryptedTemporary)
-            message = "Could not protect private data: " .. tostring(backupError)
+            message = "Could not back up the encrypted file: " .. tostring(backupError)
                 .. " Plaintext remains at " .. temporaryPath .. "."
             return
         end
@@ -577,7 +685,7 @@ local function editSelected()
         if not installed then
             if fs.exists(encryptedTemporary) then deleteFile(encryptedTemporary) end
             local restored, restoreError = pcall(fs.move, backup, entry.path)
-            message = "Could not re-encrypt private data: " .. tostring(installError)
+            message = "Could not re-encrypt the file: " .. tostring(installError)
                 .. (restored and "" or "; restoring the original failed: " .. tostring(restoreError))
                 .. " Plaintext remains at " .. temporaryPath .. "."
             return
@@ -636,6 +744,31 @@ end
 
 local function resolveHomePath(base, input)
     if type(input) ~= "string" or input:find("[%c:]") then return nil end
+    if recoveryMode then
+        local parts = {}
+        local normalizedInput = input:gsub("\\", "/")
+        local relativeInput = normalizedInput:gsub("^/+", "")
+        local absoluteHomeAppsPath = normalizedInput:sub(1, 1) == "/"
+            and (relativeInput == "apps" or relativeInput:sub(1, 5) == "apps/")
+        if normalizedInput:sub(1, 1) ~= "/" or absoluteHomeAppsPath then
+            local initialDirectory = absoluteHomeAppsPath and homeDirectory or base
+            for part in tostring(initialDirectory):gsub("^/+", ""):gmatch("[^/]+") do
+                table.insert(parts, part)
+            end
+        end
+        local pathInput = absoluteHomeAppsPath and relativeInput or normalizedInput
+        for part in pathInput:gmatch("[^/]+") do
+            if part == ".." then
+                if #parts > 0 then table.remove(parts) end
+            elseif part ~= "." then
+                table.insert(parts, part)
+            end
+        end
+        local path = "/" .. table.concat(parts, "/")
+        if isRecoveryProtectedPath(path) then return nil end
+        return path
+    end
+
     local parts = {}
     for part in homeDirectory:gmatch("[^/]+") do
         table.insert(parts, part)
@@ -686,8 +819,9 @@ local function tokenizeCommand(line)
 end
 
 local function commandPrompt()
-    local workingDirectory = isWithinRoot(currentDirectory, homeDirectory)
-        and currentDirectory or homeDirectory
+    local commandRoot = recoveryMode and "/" or homeDirectory
+    local workingDirectory = recoveryMode and currentDirectory
+        or isWithinRoot(currentDirectory, homeDirectory) and currentDirectory or homeDirectory
     local history = {}
     local width = term.getSize()
     local function writePromptLine(text, foreground)
@@ -712,7 +846,9 @@ local function commandPrompt()
     end
     local function resolvePath(input)
         local path = resolveHomePath(workingDirectory, input)
-        if not path then return nil, "Path is outside your home directory or invalid." end
+        if not path then
+            return nil, recoveryMode and "Path is protected or invalid." or "Path is outside your home directory or invalid."
+        end
         return path
     end
     local function resolveCopyDestination(source, destinationInput)
@@ -721,8 +857,13 @@ local function commandPrompt()
         if fs.isDir(destination) then
             destination = fs.combine(destination, fs.getName(source))
         end
-        if not isWithinRoot(destination, homeDirectory) or destination == homeDirectory then
-            return nil, "Destination must be inside your home directory."
+        if not isWithinRoot(destination, commandRoot) or destination == commandRoot then
+            return nil, recoveryMode and "Destination must be inside the filesystem root."
+                or "Destination must be inside your home directory."
+        end
+        if isRecoveryProtectedPath(destination)
+            or fs.isDir(source) and containsRecoveryProtectedPath(source) then
+            return nil, "That location is unavailable in recovery mode."
         end
         if destination == source then return nil, "Source and destination are the same." end
         if fs.exists(destination) then return nil, "Destination already exists." end
@@ -751,8 +892,11 @@ local function commandPrompt()
         end
         local destination, pathError = resolvePath(destinationInput or destinationName)
         if not destination then return false, pathError end
-        if destination == homeDirectory or fs.isDir(destination) then
-            return false, "Destination must be a file inside your home directory."
+        if destination == commandRoot or fs.isDir(destination) then
+            return false, recoveryMode and "Destination must be a file." or "Destination must be a file inside your home directory."
+        end
+        if isRecoveryProtectedPath(destination) then
+            return false, "That file is unavailable in recovery mode."
         end
         if fs.exists(destination) then
             return false, "Destination already exists; remove it before downloading."
@@ -804,8 +948,11 @@ local function commandPrompt()
         end
 
         local source = resolvePath(sourceInput)
-        if not source or source == homeDirectory or not fs.exists(source) or fs.isDir(source) then
-            return false, "File not found inside your home directory."
+        if not source or source == commandRoot or not fs.exists(source) or fs.isDir(source) then
+            return false, recoveryMode and "File not found." or "File not found inside your home directory."
+        end
+        if isRecoveryProtectedPath(source) then
+            return false, "That file is unavailable in recovery mode."
         end
         local fileName = fs.getName(source)
         if not fileName:match("^[%w_.%-]+%.lua$") then
@@ -891,10 +1038,11 @@ local function commandPrompt()
             end
         end
         for _, candidate in ipairs(paths) do
-            if isWithinRoot(candidate, homeDirectory)
-                and candidate:lower():match("%.lua$") and fs.exists(candidate)
-                and not fs.isDir(candidate) then
-                return candidate
+            local normalizedCandidate = candidate:gsub("^/+", "")
+            if isWithinRoot(normalizedCandidate, homeDirectory)
+                and normalizedCandidate:lower():match("%.lua$") and fs.exists(normalizedCandidate)
+                and not fs.isDir(normalizedCandidate) then
+                return normalizedCandidate
             end
         end
     end
@@ -927,6 +1075,7 @@ local function commandPrompt()
                 local path = fs.combine(searchDirectory, name)
                 local isDirectory = fs.isDir(path)
                 if (altHeld or name:sub(1, 1) ~= ".")
+                    and not isRecoveryProtectedPath(path)
                     and name:sub(1, #leaf):lower() == leaf:lower()
                     and (not luaOnly or isDirectory or name:lower():match("%.lua$")) then
                     local completion = pathPrefix:sub(1, #pathPrefix - #leaf)
@@ -978,7 +1127,8 @@ local function commandPrompt()
                 for _, name in ipairs(fs.list(homeDirectory)) do
                     local path = fs.combine(homeDirectory, name)
                     if fs.isDir(path) and name:sub(1, #commandPrefix):lower() == commandPrefix:lower()
-                        and (altHeld or name:sub(1, 1) ~= ".") then
+                        and (altHeld or name:sub(1, 1) ~= ".")
+                        and not isRecoveryProtectedPath(path) then
                         table.insert(candidates, name:sub(#commandPrefix + 1) .. "/")
                     end
                 end
@@ -1009,6 +1159,7 @@ local function commandPrompt()
             if directory and fs.isDir(directory) then
                 for _, name in ipairs(fs.list(directory)) do
                     if (altHeld or name:sub(1, 1) ~= ".")
+                        and not isRecoveryProtectedPath(fs.combine(directory, name))
                         and name:sub(1, #leaf):lower() == leaf:lower() then
                         local candidatePath = fs.combine(directory, name)
                         local isDirectory = fs.isDir(candidatePath)
@@ -1063,14 +1214,16 @@ local function commandPrompt()
             elseif command == "cd" then
                 local destination = resolveHomePath(workingDirectory, arguments[2] or "/")
                 if not destination or not fs.isDir(destination) then
-                    writePromptLine("Directory not found in your home directory.", colors.red)
+                    writePromptLine(recoveryMode and "Directory not found or unavailable."
+                        or "Directory not found in your home directory.", colors.red)
                 else
                     workingDirectory = destination
                 end
             elseif command == "ls" or command == "dir" then
                 local directory = resolveHomePath(workingDirectory, arguments[2] or ".")
                 if not directory or not fs.isDir(directory) then
-                    writePromptLine("Directory not found in your home directory.", colors.red)
+                    writePromptLine(recoveryMode and "Directory not found or unavailable."
+                        or "Directory not found in your home directory.", colors.red)
                 else
                     local names = fs.list(directory)
                     table.sort(names, function(first, second)
@@ -1080,8 +1233,10 @@ local function commandPrompt()
                     for _, name in ipairs(names) do
                         if altHeld or name:sub(1, 1) ~= "." then
                             local path = fs.combine(directory, name)
-                            writePromptLine(name .. (fs.isDir(path) and "/" or ""))
-                            shown = shown + 1
+                            if not isRecoveryProtectedPath(path) then
+                                writePromptLine(name .. (fs.isDir(path) and "/" or ""))
+                                shown = shown + 1
+                            end
                         end
                     end
                     if shown == 0 then writePromptLine("Directory is empty.", colors.lightGray) end
@@ -1091,8 +1246,10 @@ local function commandPrompt()
                     writePromptLine("Usage: mkdir <directory>", colors.red)
                 else
                     local directory = resolveHomePath(workingDirectory, arguments[2])
-                    if not directory or directory == homeDirectory then
-                        writePromptLine("Choose a directory inside your home directory.", colors.red)
+                    if not directory or directory == commandRoot
+                        or isRecoveryProtectedPath(directory) or containsRecoveryProtectedPath(directory) then
+                        writePromptLine(recoveryMode and "Choose an available directory."
+                            or "Choose a directory inside your home directory.", colors.red)
                     elseif fs.exists(directory) then
                         writePromptLine("That path already exists.", colors.red)
                     else
@@ -1107,8 +1264,10 @@ local function commandPrompt()
                     writePromptLine("Usage: rm <file or directory>", colors.red)
                 else
                     local path = resolveHomePath(workingDirectory, arguments[2])
-                    if not path or path == homeDirectory or not fs.exists(path) then
-                        writePromptLine("File or directory not found inside your home directory.", colors.red)
+                    if not path or path == commandRoot or not fs.exists(path)
+                        or isRecoveryProtectedPath(path) or containsRecoveryProtectedPath(path) then
+                        writePromptLine(recoveryMode and "File or directory not found or unavailable."
+                            or "File or directory not found inside your home directory.", colors.red)
                     else
                         local ok, err = pcall(fs.delete, path)
                         writePromptLine(ok and "Removed " .. displayPath(path) .. "."
@@ -1122,8 +1281,10 @@ local function commandPrompt()
                     writePromptLine("Usage: " .. command .. " <source> <destination>", colors.red)
                 else
                     local source = resolveHomePath(workingDirectory, arguments[2])
-                    if not source or source == homeDirectory or not fs.exists(source) then
-                        writePromptLine("Source not found inside your home directory.", colors.red)
+                    if not source or source == commandRoot or not fs.exists(source)
+                        or isRecoveryProtectedPath(source) or containsRecoveryProtectedPath(source) then
+                        writePromptLine(recoveryMode and "Source not found or unavailable."
+                            or "Source not found inside your home directory.", colors.red)
                     else
                         local destination, destinationError =
                             resolveCopyDestination(source, arguments[3])
@@ -1161,8 +1322,10 @@ local function commandPrompt()
             elseif command == "edit" then
                 local path = arguments[2] and resolveHomePath(workingDirectory, arguments[2])
                 local editorPath = shell.resolveProgram("edit")
-                if not path or path == homeDirectory or not fs.exists(path) or fs.isDir(path) then
-                    writePromptLine("Usage: edit <file inside your home directory>", colors.red)
+                if not path or path == commandRoot or isRecoveryProtectedPath(path)
+                    or not fs.exists(path) or fs.isDir(path) then
+                    writePromptLine(recoveryMode and "Usage: edit <available file>"
+                        or "Usage: edit <file inside your home directory>", colors.red)
                 elseif not editorPath then
                     writePromptLine("The built-in edit program could not be found.", colors.red)
                 else
@@ -1227,6 +1390,10 @@ local function createFile()
     end
 
     local path = fs.combine(currentDirectory, name)
+    if isRecoveryProtectedPath(path) then
+        message = "That file is unavailable in recovery mode."
+        return
+    end
     if fs.exists(path) then
         message = "That file or folder already exists."
         return
@@ -1265,6 +1432,10 @@ local function createFolder()
     end
 
     local path = fs.combine(currentDirectory, name)
+    if isRecoveryProtectedPath(path) or containsRecoveryProtectedPath(path) then
+        message = "That location is unavailable in recovery mode."
+        return
+    end
     if fs.exists(path) then
         message = "That file or folder already exists."
         return
@@ -1342,6 +1513,11 @@ local function deleteSelected()
         message = "That location cannot be deleted."
         return
     end
+    if isRecoveryProtectedPath(entry.path)
+        or entry.isDirectory and containsRecoveryProtectedPath(entry.path) then
+        message = "That location is unavailable in recovery mode."
+        return
+    end
     if not confirmDelete(entry.path) then
         message = "Deletion cancelled."
         return
@@ -1364,6 +1540,11 @@ local function copyOrCutSelected(mode)
         message = "Select a file or folder first."
         return
     end
+    if isRecoveryProtectedPath(entry.path)
+        or entry.isDirectory and containsRecoveryProtectedPath(entry.path) then
+        message = "That location is unavailable in recovery mode."
+        return
+    end
 
     clipboard = {
         path = entry.path,
@@ -1383,8 +1564,11 @@ local function pasteClipboard()
 
     refreshDiskMounts()
     if (clipboard.root ~= homeDirectory and clipboard.root ~= privateDataDirectory
+        and not (recoveryMode and clipboard.root == "/")
         and not isMountedDisk(clipboard.root))
         or not isWithinRoot(clipboard.path, clipboard.root)
+        or isRecoveryProtectedPath(clipboard.path)
+        or clipboard.isDirectory and containsRecoveryProtectedPath(clipboard.path)
         or not fs.exists(clipboard.path:sub(1, 1) == "/" and clipboard.path or "/" .. clipboard.path) then
         clipboard = nil
         message = "The copied or cut file is no longer available."
@@ -1394,6 +1578,11 @@ local function pasteClipboard()
     local destination = fs.combine(currentDirectory, clipboard.name)
     local absoluteSource = clipboard.path:sub(1, 1) == "/" and clipboard.path or "/" .. clipboard.path
     local absoluteDestination = destination:sub(1, 1) == "/" and destination or "/" .. destination
+    if isRecoveryProtectedPath(destination)
+        or clipboard.isDirectory and containsRecoveryProtectedPath(destination) then
+        message = "That location is unavailable in recovery mode."
+        return
+    end
     if not isWithinRoot(destination, currentRoot) or destination == currentRoot then
         message = "That paste location is outside the current root."
         return
@@ -1430,6 +1619,10 @@ local function saveTransferredFile(source)
     end
 
     local destination = fs.combine(currentDirectory, fileName)
+    if isRecoveryProtectedPath(destination) then
+        source.close()
+        return false, "Skipped a protected recovery file."
+    end
     if fs.isDir(destination) then
         source.close()
         return false, "Skipped " .. fileName .. " (a folder with that name exists)."
@@ -1474,6 +1667,19 @@ local function openSelected()
     local entry = entries[selected]
     if not entry then
         message = "This directory is empty."
+        return
+    end
+    if isRecoveryProtectedPath(entry.path) then
+        message = "That file is unavailable in recovery mode."
+        return
+    end
+    if entry.mainRoot then
+        currentRoot = "/"
+        currentDirectory = "/"
+        authorizedProfileRoot = nil
+        selected = 1
+        refreshEntries()
+        message = "Opened the main directory."
         return
     end
     if entry.diskRoot then
