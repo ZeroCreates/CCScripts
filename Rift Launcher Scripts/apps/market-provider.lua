@@ -1,110 +1,12 @@
 local PROTOCOL = "order_system_v1"
 local SERVER_NAME = "rift-market"
-local ACCOUNT_PROTOCOL = "rift_account_v1"
-local ACCOUNT_SERVER_NAME = "rift-server"
-local LEGACY_ACCOUNT_PROTOCOL = "rift_jobs_v1"
-local LEGACY_ACCOUNT_SERVER_NAME = "rift-jobs"
 local TIMEOUT = 5
 local ADDRESS_FILE = "provider-address.cfg"
-local RIFT_LOGIN_PATH = "rift/account.json"
-local LEGACY_LOGIN_PATH = "rift-jobs/login.json"
 local providerAddress
 local providerAddressRegistered = false
 local riftAccount = {}
-local storageLoaded, storage = pcall(require, "storage")
-if not storageLoaded or type(storage) ~= "table"
-    or type(storage.read) ~= "function" or type(storage.write) ~= "function"
-    or type(storage.delete) ~= "function" then
-    storage = nil
-end
-
-local function readRiftAccount(path)
-    local storageError
-    if storage then
-        local ok, account, err = pcall(storage.read, path)
-        if ok and account ~= nil then return account end
-        if not ok then
-            storageError = tostring(account)
-        else
-            storageError = err
-        end
-    end
-    local absolutePath = "/" .. path
-    if fs.exists(absolutePath) then
-        if fs.isDir(absolutePath) then return nil, "Saved Rift account path is a folder." end
-        local file = fs.open(absolutePath, "r")
-        if not file then return nil, "Could not open the saved Rift account at " .. absolutePath .. "." end
-        local contents = file.readAll()
-        file.close()
-        local decoded, account = pcall(textutils.unserializeJSON, contents)
-        if not decoded or type(account) ~= "table" then
-            return nil, "Saved Rift account data at " .. absolutePath .. " is invalid."
-        end
-        return account
-    end
-    if storageError and storageError ~= "Stored data was not found." then
-        return nil, "Launcher storage: " .. tostring(storageError)
-            .. "; no root account file exists at " .. absolutePath .. "."
-    end
-    return nil, "Stored data was not found."
-end
-
-local function writeRiftAccount(path, account)
-    local storageError
-    if storage then
-        local called, saved, err = pcall(storage.write, path, account)
-        if called and saved then return true end
-        storageError = called and tostring(err or "storage write failed") or tostring(saved)
-    end
-    local encoded, contents = pcall(textutils.serializeJSON, account)
-    if not encoded or type(contents) ~= "string" then
-        return false, "Rift account data could not be serialized."
-    end
-    local directory = "/" .. path:match("^(.*)/[^/]+$")
-    if not fs.exists(directory) then
-        local made, makeError = pcall(fs.makeDir, directory)
-        if not made then
-            return false, "Could not create Rift account folder: " .. tostring(makeError)
-                .. (storageError and "; launcher storage also failed: " .. storageError or "")
-        end
-    elseif not fs.isDir(directory) then
-        return false, "Rift account folder path is not a directory."
-    end
-    local file = fs.open("/" .. path, "w")
-    if not file then
-        return false, "Could not create the saved Rift account file."
-            .. (storageError and " Launcher storage also failed: " .. storageError or "")
-    end
-    local written, writeError = pcall(file.write, contents)
-    local closed, closeError = pcall(file.close)
-    if not written or not closed then
-        return false, "Could not write the saved Rift account: "
-            .. tostring(not written and writeError or closeError)
-            .. (storageError and "; launcher storage also failed: " .. storageError or "")
-    end
-    return true
-end
-
-local function deleteRiftAccount(path)
-    local storageError
-    if storage then
-        local called, deleted, err = pcall(storage.delete, path)
-        if called and deleted then return true end
-        storageError = called and err or deleted
-        if called and err == "Stored data was not found." then storageError = nil end
-    end
-    local absolutePath = "/" .. path
-    if not fs.exists(absolutePath) then
-        if storageError then return false, "Could not delete account from launcher storage: " .. tostring(storageError) end
-        return false, "Stored data was not found."
-    end
-    if fs.isDir(absolutePath) then return false, "Saved Rift account path is a folder." end
-    local deleted, deleteError = pcall(fs.delete, absolutePath)
-    if not deleted then
-        return false, "Could not delete saved Rift account: " .. tostring(deleteError)
-            .. (storageError and "; launcher storage also failed: " .. tostring(storageError) or "")
-    end
-    return true
+if type(rift) ~= "table" or type(rift.account) ~= "table" then
+    error("This version of Rift Launcher does not support Rift accounts. Update the launcher.")
 end
 
 local NEXT_STATUSES = {
@@ -204,7 +106,7 @@ local function openModems()
             found = true
         elseif peripheral.getType(name) == "monitor" and not orderMonitor then
             orderMonitor = peripheral.wrap(name)
-            orderMonitor.setTextScale(0.5)
+            if orderMonitor then orderMonitor.setTextScale(0.5) end
         end
     end
     if not found then error("Attach a modem before starting the provider page.") end
@@ -227,118 +129,17 @@ local function request(message)
     return response
 end
 
-local function readAccountField(label, hidden)
-    drawHeader("RIFT ACCOUNT", label)
-    local _, height = term.getSize()
-    writeAt(2, height - 1, "> ", colors.cyan)
-    term.setCursorPos(4, height - 1)
-    return read(hidden and "*" or nil)
-end
-
-local function authenticateAccount(username, password, action)
-    local accountProtocol = ACCOUNT_PROTOCOL
-    local serverId = rednet.lookup(accountProtocol, ACCOUNT_SERVER_NAME)
-    if not serverId then
-        accountProtocol = LEGACY_ACCOUNT_PROTOCOL
-        serverId = rednet.lookup(accountProtocol, LEGACY_ACCOUNT_SERVER_NAME)
-    end
-    if not serverId then return false, "Rift account server not found. Check that it is running and connected." end
-    rednet.send(serverId, {
-        type = action,
-        username = username,
-        password = password,
-    }, accountProtocol)
-    local senderId, response = rednet.receive(accountProtocol, TIMEOUT, serverId)
-    if senderId ~= serverId or type(response) ~= "table" then
-        return false, "No response from the Rift account server."
-    end
-    if response.type == "error" then
-        return false, response.message or "Rift account authentication failed."
-    end
-    if response.type ~= "authenticated" then
-        return false, "Unexpected response from the Rift account server."
-    end
-
-    local account, accountError = readRiftAccount(RIFT_LOGIN_PATH)
-    if account == nil and accountError and accountError ~= "Stored data was not found." then
-        return true, "Signed in, but the saved Rift account could not be read: " .. tostring(accountError)
-    end
-    if type(account) ~= "table" or type(account.username) ~= "string"
-        or account.username:lower() ~= response.username:lower() then
-        account = {}
-    end
-    account.username = response.username
-    account.password = password
-    riftAccount = account
-    local saved, saveError = writeRiftAccount(RIFT_LOGIN_PATH, account)
-    if not saved then
-        return true, "Signed in as " .. response.username
-            .. ", but the login could not be saved: " .. tostring(saveError or "unknown storage error")
-    end
-    local deleted, deleteError = deleteRiftAccount(LEGACY_LOGIN_PATH)
-    if not deleted and deleteError ~= "Stored data was not found." then
-        return true, "Signed in as " .. response.username
-            .. ", but the legacy account entry could not be removed: " .. tostring(deleteError)
-    end
-    return true, "Signed in as " .. response.username .. "."
+local function loadRiftAccount(username)
+    local address, err = rift.account.get("market", "providerAddress")
+    if err then return false, err end
+    riftAccount = { username = username, providerAddress = address }
+    return true
 end
 
 local function authenticateRiftAccount()
-    local savedLoginError
-    local login, storageError = readRiftAccount(RIFT_LOGIN_PATH)
-    if login == nil and storageError == "Stored data was not found." then
-        login, storageError = readRiftAccount(LEGACY_LOGIN_PATH)
-        if login ~= nil then
-            local saved, saveError = writeRiftAccount(RIFT_LOGIN_PATH, login)
-            if not saved then
-                savedLoginError = "Could not migrate the saved Rift account: " .. tostring(saveError)
-            else
-                local deleted, deleteError = deleteRiftAccount(LEGACY_LOGIN_PATH)
-                if not deleted and deleteError ~= "Stored data was not found." then
-                    savedLoginError = "Rift account was migrated, but the legacy account entry could not be removed: "
-                        .. tostring(deleteError)
-                end
-            end
-        end
-    end
-    if login ~= nil then
-        if type(login) ~= "table" or type(login.username) ~= "string"
-            or type(login.password) ~= "string" then
-            savedLoginError = "Saved Rift account data is invalid."
-        else
-            riftAccount = login
-            local authenticated, authError = authenticateAccount(login.username, login.password, "login")
-            if authenticated then return true end
-            savedLoginError = "Saved Rift account sign-in failed: " .. authError
-        end
-    elseif storageError and storageError ~= "Stored data was not found." then
-        savedLoginError = "Could not read the saved Rift account: " .. tostring(storageError)
-    end
-
-    while true do
-        drawHeader("RIFT", "MARKET PROVIDER  /  SIGN IN WITH YOUR RIFT ACCOUNT")
-        if savedLoginError then writeAt(2, 4, savedLoginError, colors.yellow) end
-        local choice = readChoice("s sign in|c create account|q quit")
-        if choice == "q" then return false, "Sign-in cancelled." end
-
-        local username = readAccountField("Username")
-        local password = readAccountField("Password", true)
-        local action = choice == "c" and "register" or "login"
-        if action == "register" then
-            local confirmation = readAccountField("Confirm password", true)
-            if password ~= confirmation then
-                showNotice("ACCOUNT NOT CREATED", "The passwords do not match.")
-            else
-                local authenticated, authMessage = authenticateAccount(username, password, action)
-                if authenticated then return true, authMessage end
-                showNotice("ACCOUNT NOT CREATED", authMessage)
-            end
-        else
-            local authenticated, authMessage = authenticateAccount(username, password, action)
-            if authenticated then return true, authMessage end
-            showNotice("SIGN IN FAILED", authMessage)
-        end
-    end
+    local name = rift.account.signIn()
+    if not name then return false, "Sign-in cancelled." end
+    return loadRiftAccount(name)
 end
 
 local function registerProviderAddress()
@@ -441,25 +242,13 @@ local function loadProviderAddress()
 end
 
 local function saveProviderAddress(address)
-    local account, readError = readRiftAccount(RIFT_LOGIN_PATH)
-    if account == nil and readError and readError ~= "Stored data was not found." then
-        return false, "Could not read the saved Rift account: " .. tostring(readError)
-    end
-    if type(account) ~= "table" or type(account.username) ~= "string"
-        or type(account.password) ~= "string"
-        or account.username:lower() ~= tostring(riftAccount.username or ""):lower() then
-        account = riftAccount
-    end
-    if type(account) ~= "table" or type(account.username) ~= "string"
-        or type(account.password) ~= "string" then
+    if not rift.account.current() then
         return false, "The signed-in Rift account could not be loaded."
     end
-    account.providerAddress = address
-    local saved, saveError = writeRiftAccount(RIFT_LOGIN_PATH, account)
-    if not saved then
-        return false, tostring(saveError or "Could not save the Rift account.")
+    if not rift.account.set("market", "providerAddress", address) then
+        return false, "Could not save the Rift account."
     end
-    riftAccount = account
+    riftAccount.providerAddress = address
     return true
 end
 

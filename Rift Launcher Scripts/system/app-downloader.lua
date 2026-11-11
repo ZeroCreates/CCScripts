@@ -20,15 +20,15 @@ local themes = {
     { accent = colors.lime, highlight = colors.green },
     { accent = colors.orange, highlight = colors.red },
     { accent = colors.purple, highlight = colors.magenta },
+    { accent = colors.cyan, highlight = colors.blue },
 }
 
 local function displayPath(path)
     local normalizedPath = tostring(path):gsub("^/+", "")
-    normalizedPath = normalizedPath:gsub("^%.launcher/users/", "users/")
     local systemPath = SYSTEM_APP_DIRECTORY:gsub("^/+", "")
     if normalizedPath == systemPath then return "S://" end
     if normalizedPath:sub(1, #systemPath + 1) == systemPath .. "/" then
-        return "S://" .. normalizedPath:sub(#systemPath + 2)
+        return "S://" .. normalizedPath:sub(#systemPath + 1)
     end
     local normalizedHome = homeDirectory:gsub("^/+", ""):gsub("/+$", "")
     if normalizedPath == normalizedHome then return "H://" end
@@ -249,7 +249,9 @@ local function draw()
     term.clear()
     term.setCursorPos(1, 1)
     term.setBackgroundColor(accent)
-    term.write((" RIFT LAUNCHER // APP DOWNLOADER"):sub(1, width))
+    term.setTextColor(term.isColor() and colors.black or colors.white)
+    term.write((" RIFT LAUNCHER // APP DOWNLOADER" .. string.rep(" ", width)):sub(1, width))
+    term.setTextColor(colors.white)
     term.setBackgroundColor(colors.black)
     local lastVisible = math.min(#apps, firstVisible + visibleRows - 1)
     for index = firstVisible, lastVisible do
@@ -644,6 +646,14 @@ local function uninstallApp(app)
     message = app.name .. " was uninstalled from " .. username .. "'s profile."
 end
 
+local function hideSystemApps(list)
+    local visible = {}
+    for _, app in ipairs(list) do
+        if app.scope ~= "system" then table.insert(visible, app) end
+    end
+    return visible
+end
+
 local mode, target, requestedHome = ...
 if mode == "install-system" then
     requestedHome = target
@@ -685,6 +695,9 @@ if mode == "install-system" then
                 else
                     table.insert(failures, message)
                 end
+            else
+                -- A failed refresh keeps the installed copy, so it never blocks boot.
+                pcall(updateApp, app)
             end
         end
     end
@@ -765,6 +778,10 @@ if mode == "update" then
 end
 
 while true do
+    if mode == nil then
+        apps = hideSystemApps(apps)
+        selected = math.max(1, math.min(selected, #apps))
+    end
     local buttons = draw()
     local event, key, x, y = os.pullEventRaw()
     if event == "key" then

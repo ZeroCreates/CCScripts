@@ -17,6 +17,7 @@ local ACCOUNTS_TEMP_FILE = "accounts.db.tmp"
 local state
 local sessions = {}
 local handleJobsRequest
+local cleanupJobs
 local handleMarketRequest
 local getMarketDashboardStats
 local cleanupMarketOrders
@@ -149,12 +150,104 @@ local function sendError(senderId, message, protocol)
     rednet.send(senderId, { type = "error", message = message }, protocol or ACCOUNT_PROTOCOL)
 end
 
+local requestLimits = {}
+local loginSenderLimits = {}
+local loginAccountLimits = {}
+
+local function rateBucket(buckets, key, window, create)
+    local now = os.clock()
+    local bucket = buckets[key]
+    if bucket and now - bucket.started >= window then
+        buckets[key] = nil
+        bucket = nil
+    end
+    if not bucket and create then
+        local count = 0
+        for existingKey, existing in pairs(buckets) do
+            if now - existing.started >= window then
+                buckets[existingKey] = nil
+            else
+                count = count + 1
+            end
+        end
+        if count >= 4096 then return nil end
+        bucket = { started = now, count = 0 }
+        buckets[key] = bucket
+    end
+    return bucket
+end
+
+local function rateLimited(buckets, key, limit, window)
+    local bucket = rateBucket(buckets, key, window, false)
+    return bucket and bucket.count >= limit
+end
+
+local function recordRate(buckets, key, window)
+    local bucket = rateBucket(buckets, key, window, true)
+    if not bucket then return false end
+    bucket.count = bucket.count + 1
+    return true
+end
+
 local function accountKey(username)
-    if type(username) ~= "string" then return nil end
+    if type(username) ~= "string" or #username > 128 then return nil end
     local cleaned = username:match("^%s*(.-)%s*$")
     if #cleaned < 3 or #cleaned > 24 or cleaned:find("%c") then return nil end
     if not cleaned or not cleaned:match("^[%w_-]+$") then return nil end
     return cleaned:lower(), cleaned
+end
+
+local function findAccount(identifier)
+    if type(identifier) ~= "string" or #identifier > 128 then return nil end
+    local cleaned = identifier:match("^%s*(.-)%s*$")
+    local key = accountKey(cleaned)
+    if key then return state.accounts[key] end
+    if #cleaned ~= 36 then return nil end
+    cleaned = cleaned:lower()
+    for _, account in pairs(state.accounts) do
+        local uuid = account.uuid
+        if type(uuid) == "string" and uuid:lower() == cleaned then return account end
+    end
+end
+
+local function newAccountUuid(used)
+    while true do
+        local parts = {}
+        for index = 1, 32 do
+            local digit = index == 13 and 4 or (index == 17 and math.random(8, 11) or math.random(0, 15))
+            parts[index] = string.format("%x", digit)
+        end
+        local uuid = table.concat(parts, "", 1, 8) .. "-" .. table.concat(parts, "", 9, 12)
+            .. "-" .. table.concat(parts, "", 13, 16) .. "-" .. table.concat(parts, "", 17, 20)
+            .. "-" .. table.concat(parts, "", 21, 32)
+        if not used[uuid] then return uuid end
+    end
+end
+
+local function accountUuids()
+    local used = {}
+    for _, account in pairs(state.accounts) do
+        if account.data ~= nil and type(account.data) ~= "table" then
+            error("Saved Rift account data is invalid; refusing to overwrite it.")
+        end
+        local legacyUuid = account.data and account.data["system:uuid"]
+        local uuid = account.uuid
+        if uuid == nil then uuid = legacyUuid end
+        if account.uuid ~= nil and legacyUuid ~= nil
+            and (type(account.uuid) ~= "string" or type(legacyUuid) ~= "string"
+                or account.uuid:lower() ~= legacyUuid:lower()) then
+            error("Saved Rift account UUIDs conflict; refusing to overwrite them.")
+        end
+        if uuid ~= nil then
+            if type(uuid) ~= "string" or #uuid ~= 36
+                or not uuid:lower():match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-4%x%x%x%-[89ab]%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$")
+                or used[uuid:lower()] then
+                error("Saved Rift account UUID is invalid or duplicated; refusing to overwrite it.")
+            end
+            used[uuid:lower()] = true
+        end
+    end
+    return used
 end
 
 local function registerAccount(senderId, message, protocol)
@@ -170,7 +263,7 @@ local function registerAccount(senderId, message, protocol)
         return sendError(senderId, "That Rift username is already registered.", protocol)
     end
 
-    state.accounts[key] = { username = username, password = password }
+    state.accounts[key] = { username = username, password = password, uuid = newAccountUuid(accountUuids()) }
     local saved, saveError = saveAccounts()
     if not saved then
         state.accounts[key] = nil
@@ -182,7 +275,49 @@ end
 
 local function persistAccountMigration(legacyAccountsEmbedded)
     local accountsFileExists = fs.exists(ACCOUNTS_FILE) or fs.exists(ACCOUNTS_BACKUP_FILE)
-    if not accountsFileExists then
+    local changed = false
+    local used = accountUuids()
+    for _, account in pairs(state.accounts) do
+        if not account.data then account.data = {}; changed = true end
+        local data = account.data
+        if account.uuid == nil and data["system:uuid"] ~= nil then
+            account.uuid = data["system:uuid"]
+            changed = true
+        end
+        if account.uuid == nil then
+            local uuid = newAccountUuid(used)
+            account.uuid = uuid
+            used[uuid] = true
+            changed = true
+        end
+        if data["system:uuid"] ~= nil or data["system:username"] ~= nil then
+            data["system:uuid"] = nil
+            data["system:username"] = nil
+            changed = true
+        end
+        local oldSystemKeys = {}
+        for dataKey in pairs(data) do
+            if type(dataKey) == "string" and dataKey:sub(1, 7):lower() == "system:"
+                and dataKey ~= "system:uuid" and dataKey ~= "system:username" then
+                oldSystemKeys[#oldSystemKeys + 1] = dataKey
+            end
+        end
+        for _, dataKey in ipairs(oldSystemKeys) do
+            local subkey = dataKey:sub(8)
+            if subkey ~= "" then
+                local prefix = (subkey == "deliveryAddresses" or subkey == "providerAddress")
+                    and "market:" or "legacy-system:"
+                local target = prefix .. subkey
+                if data[target] ~= nil then
+                    error("Cannot migrate account data: both " .. dataKey .. " and " .. target .. " exist.")
+                end
+                data[target] = data[dataKey]
+                data[dataKey] = nil
+                changed = true
+            end
+        end
+    end
+    if not accountsFileExists or changed then
         local saved, saveError = saveAccounts()
         if not saved then error(saveError, 0) end
     end
@@ -193,14 +328,129 @@ local function persistAccountMigration(legacyAccountsEmbedded)
 end
 
 local function loginAccount(senderId, message, protocol)
-    local key = accountKey(message.username)
-    local account = key and state.accounts[key]
+    local account = findAccount(message.username)
+    local accountId = account and account.username:lower()
+    if rateLimited(loginSenderLimits, senderId, 5, 60)
+        or (accountId and rateLimited(loginAccountLimits, accountId, 10, 60)) then
+        return sendError(senderId, "Too many sign-in attempts. Try again later.", protocol)
+    end
     if not account or type(message.password) ~= "string"
         or account.password ~= message.password then
+        local recorded = recordRate(loginSenderLimits, senderId, 60)
+        if accountId then recorded = recordRate(loginAccountLimits, accountId, 60) and recorded end
+        if not recorded then
+            return sendError(senderId, "Too many sign-in attempts. Try again later.", protocol)
+        end
         return sendError(senderId, "Username or password is incorrect.", protocol)
     end
     sessions[senderId] = account.username
     rednet.send(senderId, { type = "authenticated", username = account.username }, protocol or ACCOUNT_PROTOCOL)
+end
+
+local function lookupAccount(senderId, message, protocol)
+    if not sessions[senderId] then
+        return sendError(senderId, "Sign in to your Rift account first.", protocol)
+    end
+    if type(message.identifier) ~= "string" or #message.identifier > 128 then
+        return sendError(senderId, "Enter a valid username or UUID.", protocol)
+    end
+    local account = findAccount(message.identifier)
+    if not account then return sendError(senderId, "Rift account not found.", protocol) end
+    rednet.send(senderId, {
+        type = "account_lookup", username = account.username, uuid = account.uuid,
+    }, protocol or ACCOUNT_PROTOCOL)
+end
+
+local function accountDataWithinLimits(data)
+    local remainingBytes, remainingValues = 131072, 4096
+    local active = {}
+    local function inspect(value, depth)
+        remainingValues = remainingValues - 1
+        if remainingValues < 0 or depth > 16 then return false end
+        local valueType = type(value)
+        if valueType == "string" then
+            remainingBytes = remainingBytes - (#value * 4 + 8)
+        elseif valueType == "number" then
+            if value ~= value or value == math.huge or value == -math.huge then return false end
+            remainingBytes = remainingBytes - 32
+        elseif valueType == "boolean" then
+            remainingBytes = remainingBytes - 8
+        elseif valueType == "table" then
+            if active[value] then return false end
+            active[value] = true
+            remainingBytes = remainingBytes - 8
+            for key, item in pairs(value) do
+                local keyType = type(key)
+                if keyType ~= "string" and keyType ~= "number" and keyType ~= "boolean" then return false end
+                if not inspect(key, depth + 1) or not inspect(item, depth + 1) then return false end
+            end
+            active[value] = nil
+        else
+            return false
+        end
+        return remainingBytes >= 0
+    end
+    local entries = 0
+    for key, value in pairs(data) do
+        entries = entries + 1
+        if entries > 128 or type(key) ~= "string"
+            or not inspect(key, 0) or not inspect(value, 0) then return false end
+    end
+    return true
+end
+
+local function handleAccountData(senderId, message, protocol)
+    local username = sessions[senderId]
+    local account = username and state.accounts[username:lower()]
+    if not account then return sendError(senderId, "Sign in to your Rift account first.", protocol) end
+    if type(message.key) ~= "string" or #message.key < 1 or #message.key > 64
+        or message.key:find("[:%c]") or type(message.subkey) ~= "string"
+        or #message.subkey < 1 or #message.subkey > 64 or message.subkey:find("[:%c]") then
+        return sendError(senderId, "Key and subkey must be 1-64 characters without colons or control characters.", protocol)
+    end
+    if message.key:lower() == "system" then
+        if message.key ~= "system" or message.type ~= "get_data"
+            or (message.subkey ~= "username" and message.subkey ~= "uuid") then
+            return sendError(senderId, "The system account data namespace is read-only and reserved.", protocol)
+        end
+    end
+
+    local dataKey = message.key .. ":" .. message.subkey
+    if message.type == "get_data" then
+        local value
+        if message.key == "system" then
+            value = account[message.subkey]
+        else
+            value = account.data and account.data[dataKey]
+        end
+        return rednet.send(senderId, {
+            type = "account_data", key = message.key, subkey = message.subkey,
+            value = value, found = value ~= nil,
+        }, protocol or ACCOUNT_PROTOCOL)
+    end
+
+    local valueType = type(message.value)
+    if valueType ~= "nil" and valueType ~= "string" and valueType ~= "number"
+        and valueType ~= "boolean" and valueType ~= "table" then
+        return sendError(senderId, "Unsupported account data value.", protocol)
+    end
+    local previousData = account.data
+    account.data = account.data or {}
+    local previousValue = account.data[dataKey]
+    account.data[dataKey] = message.value
+    if message.value ~= nil and not accountDataWithinLimits(account.data) then
+        account.data[dataKey] = previousValue
+        account.data = previousData
+        return sendError(senderId, "Account data is invalid or exceeds storage limits.", protocol)
+    end
+    local ok, saved, saveError = pcall(saveAccounts)
+    if not ok or not saved then
+        account.data[dataKey] = previousValue
+        account.data = previousData
+        return sendError(senderId, ok and saveError or tostring(saved), protocol)
+    end
+    rednet.send(senderId, { type = "account_data_saved", key = message.key, subkey = message.subkey },
+        protocol or ACCOUNT_PROTOCOL)
 end
 
 local function handleAccountRequest(senderId, message, protocol)
@@ -209,6 +459,10 @@ local function handleAccountRequest(senderId, message, protocol)
     end
     if message.type == "register" then return registerAccount(senderId, message, protocol) end
     if message.type == "login" then return loginAccount(senderId, message, protocol) end
+    if message.type == "lookup" then return lookupAccount(senderId, message, protocol) end
+    if message.type == "get_data" or message.type == "set_data" then
+        return handleAccountData(senderId, message, protocol)
+    end
     if message.type == "logout" then
         sessions[senderId] = nil
         return rednet.send(senderId, { type = "logged_out" }, protocol or ACCOUNT_PROTOCOL)
@@ -725,9 +979,12 @@ local jobsModuleLoaded, createJobsServer = pcall(jobsServerChunk)
 if not jobsModuleLoaded or type(createJobsServer) ~= "function" then
     error("The Jobs module is invalid: " .. tostring(createJobsServer), 0)
 end
-handleJobsRequest = createJobsServer(state, saveState)
+handleJobsRequest, cleanupJobs = createJobsServer(state, saveState)
 if type(handleJobsRequest) ~= "function" then
     error("The Jobs module did not provide a request handler.", 0)
+end
+if type(cleanupJobs) ~= "function" then
+    error("The Jobs module did not provide a cleanup handler.", 0)
 end
 local mailServerPath = fs.combine(fs.getDir(shell.getRunningProgram()), "rift-server-email.lua")
 local mailServerChunk, mailLoadError = loadfile(mailServerPath)
@@ -770,14 +1027,23 @@ drawMonitorDashboards()
 
 while true do
     local senderId, message, receivedProtocol = rednet.receive(nil, 1)
-    if senderId and receivedProtocol == ACCOUNT_PROTOCOL then
+    local jobsCleaned, cleanupError = cleanupJobs()
+    if not jobsCleaned then lastRequest = "Jobs cleanup failed: " .. tostring(cleanupError) end
+    local knownProtocol = receivedProtocol == ACCOUNT_PROTOCOL or receivedProtocol == PROTOCOL
+        or receivedProtocol == MARKET_PROTOCOL or receivedProtocol == MAIL_PROTOCOL
+        or receivedProtocol == CASINO_PROTOCOL
+    if senderId and knownProtocol and (rateLimited(requestLimits, senderId, 60, 10)
+        or not recordRate(requestLimits, senderId, 10)) then
+        sendError(senderId, "Too many requests. Try again later.", receivedProtocol)
+    elseif senderId and receivedProtocol == ACCOUNT_PROTOCOL then
         requestsByService.login = requestsByService.login + 1
         lastRequest = "Login from #" .. senderId .. "  /  "
             .. tostring(type(message) == "table" and message.type or "invalid request")
         handleAccountRequest(senderId, message, ACCOUNT_PROTOCOL)
     elseif senderId and receivedProtocol == PROTOCOL then
         local requestType = type(message) == "table" and message.type
-        if requestType == "login" or requestType == "register" or requestType == "logout" then
+        if requestType == "login" or requestType == "register" or requestType == "logout" or requestType == "lookup"
+            or requestType == "get_data" or requestType == "set_data" then
             requestsByService.login = requestsByService.login + 1
             lastRequest = "Legacy login from #" .. senderId .. "  /  " .. requestType
             handleAccountRequest(senderId, message, PROTOCOL)

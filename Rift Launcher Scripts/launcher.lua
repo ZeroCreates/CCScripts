@@ -1,26 +1,98 @@
+
 local SYSTEM_APP_DIRECTORY = "/.launcher/apps"
 local DOWNLOADER_PATH = SYSTEM_APP_DIRECTORY .. "/app-downloader.lua"
 local SYSTEM_FILE_BROWSER_PATH = SYSTEM_APP_DIRECTORY .. "/file-browser.lua"
-local SYSTEM_CLOUD_PATH = SYSTEM_APP_DIRECTORY .. "/cloud.lua"
+local LEGACY_CLOUD_PATH = SYSTEM_APP_DIRECTORY .. "/cloud.lua"
 local SETTINGS_PROGRAM_PATH = SYSTEM_APP_DIRECTORY .. "/settings.lua"
 local HOST_BASE_URL = "https://rift.zerocreates.org/"
 local LAUNCHER_PATH = "/launcher.lua"
 local nativeFs = fs
 local nativeOs = os
 local nativeRequire = require
-local nativeMultishell = multishell
-local nativeLoadfile = loadfile
-local nativePrintError = printError
-local nativeSettingsApi = _G.settings
 local nativePullEvent = nativeOs.pullEvent
 local nativePullEventRaw = nativeOs.pullEventRaw
-local bootLocked = true
-local unfilteredPullEventRaw = nativePullEventRaw
+
+-- Black box recorder: every entry is appended and closed at once, so it survives crashes and reboots.
+local BOOT_LOG_PATH = "/.launcher/system/boot.log"
+local BOOT_LOG_OLD_PATH = BOOT_LOG_PATH .. ".old"
+local BOOT_LOG_LIMIT = 16384
+
+local function bootLog(text)
+    pcall(function()
+        if fs.getFreeSpace("/") < 4096 then return end
+        if fs.exists(BOOT_LOG_PATH) and fs.getSize(BOOT_LOG_PATH) > BOOT_LOG_LIMIT then
+            if fs.exists(BOOT_LOG_OLD_PATH) then fs.delete(BOOT_LOG_OLD_PATH) end
+            fs.move(BOOT_LOG_PATH, BOOT_LOG_OLD_PATH)
+        end
+        local handle = fs.open(BOOT_LOG_PATH, "a")
+        if not handle then return end
+        handle.write(string.format("[d%d %s +%ds] %s\n", nativeOs.day("local"),
+            textutils.formatTime(nativeOs.time("local"), true), math.floor(nativeOs.clock()),
+            tostring(text):gsub("[%c]", " "):sub(1, 300)))
+        handle.close()
+    end)
+end
+local sessionMenuAllowed = false
+local showSessionMenu
+local lockScreen
+local screenLocked = false
+local lastActivity = 0
+-- Replaced once settings load; defaults keep early boot and status-bar code safe.
+local idleLockMinutes = function() return 0 end
+local bootLogoEnabled = function() return true end
+local clockTime = function() return textutils.formatTime(nativeOs.time("local"), true) end
+local activeApps = 0
+local driverThreads = {}
+local closeAppRequested = false
+local inAppChain = false
+local pendingSessionAction
+-- Tracks Alt so the terminate menu can reveal the hidden Services list (Alt + Ctrl+T).
+local altState = { left = false, right = false }
+local rawPullEventRaw = nativePullEventRaw
+local function unfilteredPullEventRaw(filter)
+    local event = table.pack(rawPullEventRaw(filter))
+    if event[1] == "key" and event[2] == keys.leftAlt then altState.left = true
+    elseif event[1] == "key" and event[2] == keys.rightAlt then altState.right = true
+    elseif event[1] == "key_up" and event[2] == keys.leftAlt then altState.left = false
+    elseif event[1] == "key_up" and event[2] == keys.rightAlt then altState.right = false end
+    return table.unpack(event, 1, event.n)
+end
+-- Terminate never reaches the launcher; it opens the session menu instead.
 nativePullEventRaw = function(filter)
+    -- Inside the app's coroutine chain, yielding hands control back to the launcher's driver.
+    -- Outside it (ComputerCraft's event pump), yielding would stall everything.
+    local function abandonApp()
+        while true do coroutine.yield("rift_close_app") end
+    end
     while true do
+        if closeAppRequested and activeApps > 0 and inAppChain then abandonApp() end
         local event = table.pack(unfilteredPullEventRaw(filter))
-        if not bootLocked or event[1] ~= "terminate" then
+        if closeAppRequested and activeApps > 0 then
+            if inAppChain then abandonApp() end
+            return "rift_close_app"
+        end
+        if event[1] ~= "terminate" then
             return table.unpack(event, 1, event.n)
+        end
+        if sessionMenuAllowed and showSessionMenu then
+            local inApp = activeApps > 0
+            local action = showSessionMenu(inApp)
+            if inApp then
+                if action == "close_app" or action == "switch_user" or action == "logout" then
+                    if action ~= "close_app" then pendingSessionAction = action end
+                    closeAppRequested = true
+                    if inAppChain then abandonApp() end
+                    -- The event pump returns an event so every coroutine, including the driver, wakes.
+                    return "rift_close_app"
+                elseif action == "switch_task" and not inAppChain then
+                    -- Wake the driver, which performs the switch without dropping the running app.
+                    nativeOs.queueEvent("rift_switch")
+                    return "rift_switch"
+                end
+            elseif action == "switch_user" or action == "logout" or action == "switch_task" then
+                return "session_action", action
+            end
+            if filter == nil then return "menu_closed" end
         end
     end
 end
@@ -34,119 +106,502 @@ local apps = {}
 local selected = 1
 local firstVisible = 1
 local message = ""
-local shiftDown = false
 local currentUser
 local homeDirectory
 local profilePasswords = {}
 local profileAdmins = {}
 local authorizedProfiles = {}
-local launchHomeProgramInTab = false
 local autoLaunchSession = false
-local cloudService
-local cloudServiceFilter
-local cloudServicePreviousTerm
-local cloudServiceTerminal
-local cloudServiceStatus
-local cloudServiceErrorPath
-local cloudServiceCode
-local programTerminationRequested = false
-local pullEventWithCloud
+local driverDepth = setmetatable({}, { __mode = "k" })
 
-local function createProgramOs(parent)
-    local programOs = {}
-    for name, value in pairs(parent or nativeOs) do programOs[name] = value end
-    programOs.pullEvent = function(filter)
-        return pullEventWithCloud(filter, false, true)
+local statusBarActive = false
+local statusBarRedraw
+local notificationHistory = {}
+local currentToast
+
+local function playNotificationSound()
+    if type(peripheral) ~= "table" then return end
+    local ok, speaker = pcall(peripheral.find, "speaker")
+    if ok and speaker and type(speaker.playNote) == "function" then
+        pcall(speaker.playNote, "bell", 1, 18)
+        pcall(speaker.playNote, "bell", 1, 22)
     end
-    programOs.pullEventRaw = function(filter)
-        return pullEventWithCloud(filter, true, true)
-    end
-    return programOs
 end
 
-local function createCloudMirrorTerminal(parent, mirror)
-    local terminal = {}
-    local methods = {
-        "write", "blit", "clear", "clearLine", "getCursorPos", "setCursorPos",
-        "getCursorBlink", "setCursorBlink", "getSize", "scroll",
-        "getTextColor", "getTextColour", "setTextColor", "setTextColour",
-        "getBackgroundColor", "getBackgroundColour", "setBackgroundColor", "setBackgroundColour",
-        "isColor", "isColour", "getPaletteColor", "getPaletteColour",
-        "setPaletteColor", "setPaletteColour",
-    }
-    local aliases = {
-        getTextColor = "getTextColour",
-        getTextColour = "getTextColor",
-        setTextColor = "setTextColour",
-        setTextColour = "setTextColor",
-        getBackgroundColor = "getBackgroundColour",
-        getBackgroundColour = "getBackgroundColor",
-        setBackgroundColor = "setBackgroundColour",
-        setBackgroundColour = "setBackgroundColor",
-        isColor = "isColour",
-        isColour = "isColor",
-        getPaletteColor = "getPaletteColour",
-        getPaletteColour = "getPaletteColor",
-        setPaletteColor = "setPaletteColour",
-        setPaletteColour = "setPaletteColor",
-    }
-    local readOnly = {
-        getCursorPos = true,
-        getCursorBlink = true,
-        getSize = true,
-        getTextColor = true,
-        getTextColour = true,
-        getBackgroundColor = true,
-        getBackgroundColour = true,
-        isColor = true,
-        isColour = true,
-        getPaletteColor = true,
-        getPaletteColour = true,
-    }
-    for _, name in ipairs(methods) do
-        local methodName = name
-        terminal[methodName] = function(...)
-            local parentMethod = parent[methodName] or parent[aliases[methodName] or ""]
-            if readOnly[methodName] then
-                return parentMethod(...)
+-- Shared state for rift.permissions, rift.account and notification muting; one table keeps top-level locals low.
+local riftModules = { muted = {} }
+
+local function notifyUser(text, options)
+    options = type(options) == "table" and options or {}
+    text = tostring(text):gsub("[%c]", " ")
+    if options.title ~= nil then
+        text = tostring(options.title):gsub("[%c]", " "):sub(1, 30) .. ": " .. text
+    end
+    text = text:sub(1, 120)
+    if options.app and riftModules.muted[tostring(options.app)] then return false end
+    -- A key makes a notification unique: identical text is skipped, new text replaces the old entry.
+    local key = type(options.key) == "string" and options.key:sub(1, 64) or nil
+    if key then
+        for index, entry in ipairs(notificationHistory) do
+            if entry.key == key then
+                if entry.text == text then return false end
+                table.remove(notificationHistory, index)
+                break
             end
-            local result = table.pack(parentMethod(...))
-            local mirrorMethod = mirror[methodName] or mirror[aliases[methodName] or ""]
-            if mirrorMethod then mirrorMethod(...) end
-            return table.unpack(result, 1, result.n)
         end
     end
-    return terminal
-end
-
-local function restoreCloudMirrorTerminal()
-    if cloudServiceTerminal then term.redirect(cloudServiceTerminal) end
-end
-
-local function saveCloudServiceError(err)
-    if not cloudServiceErrorPath then return false, "Cloud error log path is unavailable." end
-    local contents = tostring(err)
-    if cloudServiceCode then contents = contents:gsub(cloudServiceCode, "[redacted]") end
-    local file, openError = nativeFs.open(cloudServiceErrorPath, "w")
-    if not file then return false, tostring(openError or "Could not create the error log.") end
-    local wrote, writeError = pcall(file.write, contents)
-    local closed, closeError = pcall(file.close)
-    if not wrote then return false, tostring(writeError) end
-    if not closed then return false, tostring(closeError) end
+    local priority = options.priority == "low" and "low" or options.priority == "high" and "high" or "normal"
+    notificationHistory[#notificationHistory + 1] = {
+        text = text, time = nativeOs.time("local"), key = key, app = options.app, priority = priority,
+    }
+    if #notificationHistory > 20 then table.remove(notificationHistory, 1) end
+    local seconds = priority == "high" and 10 or priority == "low" and 3 or 5
+    currentToast = { text = text, expires = nativeOs.clock() + seconds }
+    bootLog("NOTIFY " .. (priority ~= "normal" and ("[" .. priority .. "] ") or "") .. text)
+    if priority ~= "low" then playNotificationSound() end
+    if statusBarRedraw then
+        pcall(statusBarRedraw)
+    else
+        message = text
+    end
     return true
 end
 
-local function reportCloudServiceError(err)
-    local saved, saveError = saveCloudServiceError(err)
-    if saved then
-        cloudServiceStatus = "Failed; details in " .. nativeFs.getName(cloudServiceErrorPath)
-        message = "Cloud Catcher: " .. cloudServiceStatus
-    else
-        cloudServiceStatus = "Failed: " .. tostring(saveError)
-        message = "Cloud Catcher: " .. cloudServiceStatus
-    end
-    nativePrintError("Cloud Catcher stopped: " .. tostring(err))
+local serviceTick = { timer = nil, deadline = 0 }
+local updateCheck = { pending = false, notifiedFor = nil }
+local UPDATE_CHECK_URL = HOST_BASE_URL .. "launcher.lua"
+
+local function normalizeSource(text)
+    text = text:gsub("^\239\187\191", "")
+    text = text:gsub("\r\n", "\n")
+    return (text:gsub("\r", "\n"))
 end
+
+local function startUpdateCheck()
+    if updateCheck.pending or not http or type(http.request) ~= "function" then return end
+    if pcall(http.request, UPDATE_CHECK_URL) then updateCheck.pending = true end
+end
+
+local function finishUpdateCheck(event)
+    updateCheck.pending = false
+    if event[1] ~= "http_success" or type(event[3]) ~= "table" then return end
+    local response = event[3]
+    local code = response.getResponseCode and response.getResponseCode()
+    local ok, contents = pcall(response.readAll)
+    pcall(response.close)
+    if (code and code ~= 200) or not ok or type(contents) ~= "string" or contents == "" then
+        bootLog("UPDATE-CHECK failed code=" .. tostring(code))
+        return
+    end
+    contents = normalizeSource(contents)
+    if updateCheck.notifiedFor == contents then return end
+    local file = fs.open(LAUNCHER_PATH, "r")
+    local current = file and normalizeSource(file.readAll())
+    if file then file.close() end
+    if current == contents then
+        bootLog("UPDATE-CHECK up to date")
+        return
+    end
+    updateCheck.notifiedFor = contents
+    bootLog("UPDATE-CHECK new launcher available (" .. #contents .. " bytes)")
+    notifyUser("Launcher update available. Reboot to apply it.")
+end
+
+-- Background services: interval jobs and event hooks that run alongside any app.
+local services = {
+    {
+        name = "update-check", interval = 1800, nextRun = nativeOs.clock() + 1800,
+        run = startUpdateCheck,
+        onEvent = function(event)
+            if updateCheck.pending and (event[1] == "http_success" or event[1] == "http_failure")
+                and event[2] == UPDATE_CHECK_URL then
+                finishUpdateCheck(event)
+                return true
+            end
+        end,
+    },
+    {
+        name = "disk-watch",
+        onEvent = function(event)
+            if event[1] == "disk" then
+                bootLog("DISK inserted " .. tostring(event[2]))
+                notifyUser("Disk inserted (" .. tostring(event[2]) .. ").")
+            elseif event[1] == "disk_eject" then
+                bootLog("DISK removed " .. tostring(event[2]))
+                notifyUser("Disk removed (" .. tostring(event[2]) .. ").")
+            elseif event[1] == "peripheral" or event[1] == "peripheral_detach" then
+                bootLog("PERIPHERAL " .. event[1] .. " " .. tostring(event[2]))
+            elseif event[1] == "monitor_resize" or event[1] == "term_resize" then
+                bootLog("DISPLAY " .. event[1])
+            end
+        end,
+    },
+}
+
+-- Returns true when the event belonged to a service and should not reach apps.
+local function serviceHandle(event)
+    local now = nativeOs.clock()
+    local name = event[1]
+    local consumed = false
+    if name == "key" or name == "char" or name == "mouse_click" or name == "mouse_scroll"
+        or name == "mouse_drag" or name == "paste" then
+        lastActivity = now
+    end
+    if name == "timer" and event[2] == serviceTick.timer then
+        serviceTick.timer = nil
+        consumed = true
+    end
+    if not serviceTick.timer or now > serviceTick.deadline + 5 then
+        serviceTick.timer = nativeOs.startTimer(15)
+        serviceTick.deadline = now + 15
+    end
+    if name == "rift_lock" then
+        consumed = true
+        bootLog("LOCK requested by " .. tostring(currentUser))
+        if lockScreen and not lockScreen() then
+            notifyUser("Set a password for this account to use the lock screen.")
+        end
+    elseif sessionMenuAllowed and currentUser and not screenLocked then
+        local minutes = idleLockMinutes()
+        if minutes > 0 and now - lastActivity >= minutes * 60 then
+            if not (lockScreen and lockScreen()) then lastActivity = now end
+        end
+    end
+    for _, service in ipairs(services) do
+        if service.interval and now >= service.nextRun then
+            service.nextRun = now + service.interval
+            pcall(service.run)
+        end
+        if service.onEvent then
+            local ok, result = pcall(service.onEvent, event)
+            if ok and result then consumed = true end
+        end
+    end
+    return consumed
+end
+
+local function drawStatusBar(target, statusWindow)
+    local width = target.getSize()
+    local isColor = target.isColor()
+    if currentToast and nativeOs.clock() >= currentToast.expires then currentToast = nil end
+    local clock = clockTime()
+    local label = currentToast and currentToast.text
+        or ("Rift Launcher" .. (currentUser and ("  " .. currentUser) or ""))
+    local rightText = clock .. " "
+    local available = math.max(0, width - 6 - #rightText)
+    label = (" " .. label):sub(1, available)
+    local line = label .. string.rep(" ", available - #label) .. rightText
+    local previousBackground, previousText = target.getBackgroundColor(), target.getTextColor()
+    target.setCursorPos(1, 1)
+    target.setBackgroundColor(isColor and colors.gray or colors.black)
+    target.setTextColor(colors.white)
+    target.write(line)
+    target.setBackgroundColor(isColor and colors.lightGray or colors.white)
+    target.setTextColor(colors.black)
+    target.write(" _ ")
+    target.setBackgroundColor(isColor and colors.red or colors.white)
+    target.setTextColor(isColor and colors.white or colors.black)
+    target.write(" X ")
+    target.setBackgroundColor(previousBackground)
+    target.setTextColor(previousText)
+    if statusWindow and statusWindow.restoreCursor then statusWindow.restoreCursor() end
+end
+
+local rawInputEvents = {
+    key = true, key_up = true, char = true, paste = true, terminate = true,
+    mouse_click = true, mouse_up = true, mouse_drag = true, mouse_scroll = true,
+}
+local tasks = {}
+-- Headless background services (see the "Background services" section); state lives in one table.
+local bgServices = { list = {}, restarts = {}, crashes = {}, status = {} }
+local nextTaskId = 1
+local foregroundTask
+local pendingSwitchTask
+local nextTaskName
+local statusTimerId
+
+local function removeTask(task)
+    for index, candidate in ipairs(tasks) do
+        if candidate == task then
+            table.remove(tasks, index)
+            return
+        end
+    end
+end
+
+local function findTask(id)
+    for _, task in ipairs(tasks) do
+        if task.id == id then return task end
+    end
+end
+
+local function resumeTask(task, event, background)
+    local previousTerm = term.current()
+    local previousChain = inAppChain
+    inAppChain = true
+    term.redirect(task.term)
+    local previousQuiet = bgServices.quiet
+    local previousApp = bgServices.currentApp
+    bgServices.currentApp = task.appPath or previousApp
+    bgServices.quiet = background == true
+    local packed = table.pack(coroutine.resume(task.co, table.unpack(event, 1, event.n)))
+    bgServices.currentApp = previousApp
+    bgServices.quiet = previousQuiet
+    task.term = term.current()
+    term.redirect(previousTerm)
+    inAppChain = previousChain
+    task.packed = packed
+    task.filter = packed[2]
+    if coroutine.status(task.co) == "dead" then task.finished = true end
+end
+
+-- Gives every background task the non-input events a foreground app would see.
+local function pumpBackground(event)
+    local name = event[1]
+    if serviceHandle(event) then return true end
+    if name == "term_resize" then
+        local width, height = term.native().getSize()
+        for _, task in ipairs(tasks) do
+            pcall(task.window.reposition, 1, 2, width, height - 1)
+        end
+    end
+    if rawInputEvents[name] or closeAppRequested or pendingSessionAction then return end
+    if type(name) == "string" and (name:sub(1, 5) == "rift_" or name == "session_action"
+        or name == "menu_closed") then
+        return
+    end
+    if bgServices.pump then bgServices.pump(event) end
+    for _, task in ipairs({ table.unpack(tasks) }) do
+        if task ~= foregroundTask and not task.finished
+            and (task.filter == nil or task.filter == name) then
+            resumeTask(task, event, true)
+            if task.finished then
+                removeTask(task)
+                if task.packed[1] == false then
+                    notifyUser(task.name .. " crashed: " .. tostring(task.packed[2]))
+                else
+                    notifyUser(task.name .. " finished.")
+                end
+            end
+        end
+    end
+end
+
+local function showTask(task, savedTerm)
+    foregroundTask = task
+    local width, height = savedTerm.getSize()
+    task.window.reposition(1, 2, width, height - 1, savedTerm)
+    task.window.setVisible(true)
+    term.redirect(task.term)
+    statusBarRedraw = function() drawStatusBar(savedTerm, task.window) end
+    statusBarRedraw()
+end
+
+local function runForeground(task, savedTerm)
+    local parent = coroutine.running() or "main"
+    driverDepth[parent] = (driverDepth[parent] or 0) + 1
+    local previousDriver = driverThreads[parent]
+    driverThreads[parent] = true
+    closeAppRequested = false
+    activeApps = activeApps + 1
+    statusBarActive = true
+    showTask(task, savedTerm)
+    statusTimerId = nativeOs.startTimer(1)
+    if not task.started then
+        task.started = true
+        resumeTask(task, task.startArgs)
+    end
+
+    local outcome
+    while true do
+        if pendingSwitchTask then
+            local target = findTask(pendingSwitchTask)
+            pendingSwitchTask = nil
+            if target and target ~= task and not target.finished then
+                task.window.setVisible(false)
+                task = target
+                showTask(task, savedTerm)
+            end
+        end
+        if task.finished then
+            outcome = "done"
+            break
+        end
+        if pendingSessionAction or closeAppRequested then
+            outcome = "killed"
+            break
+        end
+        local event = table.pack(unfilteredPullEventRaw())
+        local name = event[1]
+        local deliver = true
+        local width = savedTerm.getSize()
+        if name == "rift_switch" then
+            deliver = false
+        elseif name == "timer" and event[2] == statusTimerId then
+            statusBarRedraw()
+            statusTimerId = nativeOs.startTimer(1)
+            deliver = false
+        elseif name == "term_resize" then
+            task.window.reposition(1, 2, width, select(2, savedTerm.getSize()) - 1)
+            statusBarRedraw()
+        elseif name == "mouse_click" or name == "mouse_up" or name == "mouse_drag"
+            or name == "mouse_scroll" then
+            if event[4] == 1 then
+                if name == "mouse_click" then
+                    if event[3] > width - 3 then
+                        outcome = "killed"
+                        break
+                    elseif event[3] > width - 6 then
+                        outcome = "minimized"
+                        break
+                    end
+                end
+                deliver = false
+            else
+                event[4] = event[4] - 1
+            end
+        end
+        if name == "terminate" and (driverDepth[task.co] or 0) == 0 then
+            local menuOk, action = pcall(showSessionMenu, true)
+            if not menuOk then action = "exit" end
+            if action == "close_app" then
+                outcome = "killed"
+                break
+            elseif action == "switch_user" or action == "logout" then
+                pendingSessionAction = action
+                outcome = "killed"
+                break
+            end
+        else
+            if pumpBackground(event) then deliver = false end
+            if deliver and not task.finished
+                and (task.filter == nil or task.filter == name or name == "terminate") then
+                resumeTask(task, event)
+            end
+        end
+    end
+
+    driverDepth[parent] = driverDepth[parent] - 1
+    activeApps = activeApps - 1
+    driverThreads[parent] = previousDriver
+    statusBarActive = false
+    statusBarRedraw = nil
+    foregroundTask = nil
+    if closeAppRequested or pendingSessionAction then outcome = "killed" end
+    term.redirect(savedTerm)
+    if outcome == "minimized" then
+        task.window.setVisible(false)
+    else
+        removeTask(task)
+    end
+    if outcome == "done" then
+        return table.unpack(task.packed, 1, task.packed.n)
+    end
+    closeAppRequested = false
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.setCursorBlink(false)
+    term.clear()
+    term.setCursorPos(1, 1)
+    return true, true
+end
+
+-- Nested programs (apps launched from inside an app) run in the parent's window.
+local function runNested(fn, ...)
+    local parent = coroutine.running() or "main"
+    driverDepth[parent] = (driverDepth[parent] or 0) + 1
+    local previousDriver = driverThreads[parent]
+    driverThreads[parent] = true
+    local savedTerm = term.current()
+    closeAppRequested = false
+    activeApps = activeApps + 1
+    local co = coroutine.create(fn)
+    local previousChain = inAppChain
+    inAppChain = true
+    local packed = table.pack(coroutine.resume(co, ...))
+    inAppChain = previousChain
+    local closed = false
+    while coroutine.status(co) ~= "dead" do
+        if pendingSessionAction or closeAppRequested then
+            closed = true
+            break
+        end
+        local event = table.pack(unfilteredPullEventRaw())
+        local name = event[1]
+        if name == "timer" and statusBarRedraw and event[2] == statusTimerId then
+            statusBarRedraw()
+            statusTimerId = nativeOs.startTimer(1)
+        elseif name == "terminate" and (driverDepth[co] or 0) == 0 then
+            local menuOk, action = pcall(showSessionMenu, true)
+            if not menuOk then action = "exit" end
+            if action == "close_app" then
+                closed = true
+                break
+            elseif action == "switch_user" or action == "logout" then
+                pendingSessionAction = action
+                closed = true
+                break
+            end
+        elseif name ~= "rift_switch" then
+            pumpBackground(event)
+            if packed[2] == nil or name == packed[2] or name == "terminate" then
+                local resumeChain = inAppChain
+                inAppChain = true
+                packed = table.pack(coroutine.resume(co, table.unpack(event, 1, event.n)))
+                inAppChain = resumeChain
+            end
+        end
+    end
+    driverDepth[parent] = driverDepth[parent] - 1
+    activeApps = activeApps - 1
+    driverThreads[parent] = previousDriver
+    if closeAppRequested or pendingSessionAction then closed = true end
+    if closed then
+        closeAppRequested = false
+        term.redirect(savedTerm)
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.setCursorBlink(false)
+        term.clear()
+        term.setCursorPos(1, 1)
+        return true, true
+    end
+    return table.unpack(packed, 1, packed.n)
+end
+
+-- Top-level programs become tasks: each has its own window under the status bar and can run in the background.
+local function runClosable(fn, ...)
+    local savedTerm = term.current()
+    local width, height = savedTerm.getSize()
+    if statusBarActive or height < 8 or not window or not window.create then
+        return runNested(fn, ...)
+    end
+    local task = {
+        id = nextTaskId,
+        name = nextTaskName or "App",
+        co = coroutine.create(fn),
+        startArgs = table.pack(...),
+        appPath = bgServices.nextPath,
+    }
+    bgServices.nextPath = nil
+    nextTaskId = nextTaskId + 1
+    nextTaskName = nil
+    task.window = window.create(savedTerm, 1, 2, width, height - 1, false)
+    if type(savedTerm.getPaletteColor) == "function" and type(task.window.setPaletteColor) == "function" then
+        for index = 0, 15 do
+            local color = 2 ^ index
+            pcall(task.window.setPaletteColor, color, savedTerm.getPaletteColor(color))
+        end
+    end
+    task.window.setBackgroundColor(colors.black)
+    task.window.setTextColor(colors.white)
+    task.window.clear()
+    task.window.setCursorPos(1, 1)
+    task.term = task.window
+    tasks[#tasks + 1] = task
+    return runForeground(task, savedTerm)
+end
+
 local USER_ROOT = "/users"
 local SYSTEM_DIRECTORY = "/.launcher"
 local SETTINGS_PATH = SYSTEM_DIRECTORY .. "/settings.json"
@@ -159,11 +614,10 @@ local STARTUP_TEMPORARY_PATH = SYSTEM_DIRECTORY .. "/startup.lua.tmp"
 
 local function displayLauncherPath(path)
     local normalizedPath = tostring(path):gsub("^/+", "")
-    normalizedPath = normalizedPath:gsub("^%.launcher/users/", "users/")
     local systemProgramsPath = SYSTEM_APP_DIRECTORY:gsub("^/+", "")
     if normalizedPath == systemProgramsPath then return "S://" end
     if normalizedPath:sub(1, #systemProgramsPath + 1) == systemProgramsPath .. "/" then
-        return "S://" .. normalizedPath:sub(#systemProgramsPath + 2)
+        return "S://" .. normalizedPath:sub(#systemProgramsPath + 1)
     end
     local launcherPath = LAUNCHER_PATH:gsub("^/+", "")
     if normalizedPath == launcherPath then return "S://" .. launcherPath end
@@ -181,7 +635,7 @@ local function displayLauncherPath(path)
 end
 
 local function displayLauncherMessage(text)
-    text = tostring(text):gsub("%.launcher/users/", "users/")
+    text = tostring(text)
     local systemProgramsPattern = SYSTEM_APP_DIRECTORY:gsub("^/+", ""):gsub("([^%w])", "%%%1")
     text = text:gsub("/" .. systemProgramsPattern .. "/", "S://")
         :gsub("/" .. systemProgramsPattern .. "%f[%W]", "S://")
@@ -208,7 +662,14 @@ local THEMES = {
 local DEFAULT_CYAN = { 0.298, 0.600, 0.698 }
 local DEFAULT_BLUE = { 0.200, 0.400, 0.800 }
 
+local bootStatus
+
 local function drawBootScreen()
+    if not bootLogoEnabled() and not bootStatus then
+        term.setBackgroundColor(colors.black)
+        term.clear()
+        return
+    end
     local width, height = term.getSize()
     local accent = term.isColor() and colors.cyan or colors.white
     local centerRow = math.max(1, math.floor(height / 2))
@@ -237,38 +698,227 @@ local function drawBootScreen()
         writeCentered(math.max(1, centerRow - 1), "RIFT", accent)
         writeCentered(math.min(height, centerRow + 1), "LAUNCHER", colors.lightGray)
     end
+    if bootStatus then writeCentered(height, bootStatus, colors.orange) end
 end
 
+local RECOVERY_DIRECTORY = "/.launcher/system"
+local GOOD_LAUNCHER_PATH = RECOVERY_DIRECTORY .. "/launcher.good"
+local BAD_LAUNCHER_PATH = RECOVERY_DIRECTORY .. "/launcher.bad"
+local PENDING_BOOT_PATH = RECOVERY_DIRECTORY .. "/boot.pending"
+local function viewBootLog()
+    local contents = ""
+    for _, path in ipairs({ BOOT_LOG_OLD_PATH, BOOT_LOG_PATH }) do
+        if fs.exists(path) then
+            local handle = fs.open(path, "r")
+            if handle then contents = contents .. (handle.readAll() or ""); handle.close() end
+        end
+    end
+    if contents == "" then contents = "The boot log is empty.\n" end
+    local lines = {}
+    for line in contents:gmatch("(.-)\n") do lines[#lines + 1] = line end
+    local _, startHeight = term.getSize()
+    local top = math.max(1, #lines - (startHeight - 3))
+    while true do
+        local width, height = term.getSize()
+        local page = height - 2
+        top = math.max(1, math.min(top, math.max(1, #lines - page + 1)))
+        term.setBackgroundColor(colors.black)
+        term.clear()
+        term.setTextColor(term.isColor() and colors.cyan or colors.white)
+        term.setCursorPos(1, 1)
+        term.write(("Black box " .. top .. "-" .. math.min(#lines, top + page - 1) .. "/" .. #lines
+            .. " Up/Dn PgUp/PgDn End C=clear"):sub(1, width))
+        term.setTextColor(colors.white)
+        for row = 1, page do
+            local line = lines[top + row - 1]
+            if not line then break end
+            term.setCursorPos(1, row + 1)
+            term.write(line:sub(1, width))
+        end
+        local event, key = unfilteredPullEventRaw()
+        if event == "key" then
+            if key == keys.up then
+                top = top - 1
+            elseif key == keys.down then
+                top = top + 1
+            elseif key == keys.pageUp then
+                top = top - page
+            elseif key == keys.pageDown then
+                top = top + page
+            elseif key == keys.home then
+                top = 1
+            elseif key == keys["end"] then
+                top = #lines
+            elseif key == keys.c then
+                pcall(fs.delete, BOOT_LOG_PATH)
+                pcall(fs.delete, BOOT_LOG_OLD_PATH)
+                lines, top = { "The boot log is empty." }, 1
+            else
+                return
+            end
+        elseif event == "mouse_scroll" then
+            top = top + key * 3
+        end
+    end
+end
 local function startBootPhase()
     drawBootScreen()
     sleep(0.7)
 end
 
+-- Shows the boot logo and reports whether R was held while it was up.
+local function bootRecoveryRequested()
+    drawBootScreen()
+    local timer = nativeOs.startTimer(0.7)
+    local requested = false
+    while true do
+        local event, value = unfilteredPullEventRaw()
+        if event == "timer" and value == timer then break end
+        if event == "key" and value == keys.r then requested = true end
+    end
+    return requested
+end
+
+local function readWholeFile(path)
+    local file = fs.exists(path) and fs.open(path, "r")
+    if not file then return nil end
+    local contents = file.readAll()
+    file.close()
+    return contents
+end
+
+local function restoreGoodLauncher()
+    if not fs.exists(GOOD_LAUNCHER_PATH) then return false end
+    if fs.exists(LAUNCHER_PATH) then
+        if fs.exists(BAD_LAUNCHER_PATH) then fs.delete(BAD_LAUNCHER_PATH) end
+        pcall(fs.copy, LAUNCHER_PATH, BAD_LAUNCHER_PATH)
+        fs.delete(LAUNCHER_PATH)
+    end
+    local ok = pcall(fs.copy, GOOD_LAUNCHER_PATH, LAUNCHER_PATH)
+    return ok and fs.exists(LAUNCHER_PATH)
+end
+
+-- A boot marker left over from a previous update means that update never reached the home screen.
+-- "pending" is written by the updater just before rebooting; the new launcher promotes it to
+-- "booting". Finding "booting" at startup means the new launcher never reached the home screen.
+local function recoverFromFailedUpdate()
+    if not fs.exists(PENDING_BOOT_PATH) then return false end
+    local state = readWholeFile(PENDING_BOOT_PATH)
+    if state ~= "booting" then
+        local marker = fs.open(PENDING_BOOT_PATH, "w")
+        if marker then marker.write("booting"); marker.close() end
+        bootLog("First boot of an updated launcher")
+        return false
+    end
+    fs.delete(PENDING_BOOT_PATH)
+    bootLog("Previous update never reached the home screen; restoring last good launcher")
+    if restoreGoodLauncher() and type(nativeOs.reboot) == "function" then
+        nativeOs.reboot()
+        while true do sleep(1) end
+    end
+    return true
+end
+
+local function recoveryMenu()
+    local options = {
+        { "Continue boot (skip update)", "continue" },
+        { "Retry update", "retry" },
+        { "View boot log", "log" },
+        { "Restore last good launcher", "restore" },
+        { "Open shell", "shell" },
+        { "Reboot", "reboot" },
+    }
+    local choice, note = 1, ""
+    while true do
+        local width = term.getSize()
+        term.setBackgroundColor(colors.black)
+        term.clear()
+        term.setTextColor(term.isColor() and colors.cyan or colors.white)
+        term.setCursorPos(2, 2)
+        term.write("Rift Launcher Recovery")
+        for index, option in ipairs(options) do
+            term.setCursorPos(2, 3 + index)
+            term.setTextColor(index == choice and colors.white or colors.lightGray)
+            term.write((index == choice and "> " or "  ") .. option[1])
+        end
+        term.setCursorPos(2, 4 + #options + 1)
+        term.setTextColor(colors.lightGray)
+        term.write(note:sub(1, width - 2))
+        local event, key = unfilteredPullEventRaw()
+        if event == "key" then
+            if key == keys.up then
+                choice = math.max(1, choice - 1)
+            elseif key == keys.down then
+                choice = math.min(#options, choice + 1)
+            elseif key == keys.enter then
+                local action = options[choice][2]
+                if action == "retry" and fs.exists(BAD_LAUNCHER_PATH) then fs.delete(BAD_LAUNCHER_PATH) end
+                if action == "continue" or action == "retry" then
+                    bootLog("Recovery menu: " .. action)
+                    return action
+                elseif action == "log" then
+                    viewBootLog()
+                elseif action == "restore" then
+                    if restoreGoodLauncher() then
+                        bootLog("Recovery menu: restored last good launcher")
+                        nativeOs.reboot()
+                        while true do sleep(1) end
+                    end
+                    note = "No backup is available."
+                elseif action == "shell" then
+                    term.setBackgroundColor(colors.black)
+                    term.setTextColor(colors.white)
+                    term.clear()
+                    term.setCursorPos(1, 1)
+                    print("Recovery shell. Run 'reboot' to leave.")
+                    print("Log: edit " .. BOOT_LOG_PATH)
+                    pcall(nativeOs.run, _ENV, "/rom/programs/shell.lua")
+                else
+                    nativeOs.reboot()
+                    while true do sleep(1) end
+                end
+            end
+        end
+    end
+end
+
+local skipLauncherUpdate = false
+
 local function autoUpdateLauncher()
     drawBootScreen()
-    if not http or type(http.get) ~= "function" then
+    if skipLauncherUpdate then
+        bootStatus = "Update skipped: recovery mode"
         drawBootScreen()
+        sleep(2.5)
+        bootStatus = nil
         return
+    end
+    local function fail(reason)
+        bootLog("Launcher update skipped: " .. tostring(reason))
+        bootStatus = "Update skipped: " .. tostring(reason)
+        drawBootScreen()
+        sleep(2.5)
+        bootStatus = nil
+    end
+    if not http or type(http.get) ~= "function" then
+        return fail("HTTP is disabled")
     end
 
     local requested, response, requestError = pcall(http.get, HOST_BASE_URL .. "launcher.lua")
     if not requested or not response then
-        drawBootScreen()
-        return
+        return fail(requested and (response == nil and requestError) or response or "request failed")
     end
 
     local responseCode = response.getResponseCode and response.getResponseCode()
     if responseCode and responseCode ~= 200 then
         response.close()
-        drawBootScreen()
-        return
+        return fail("server returned " .. tostring(responseCode))
     end
 
     local readOk, contents = pcall(response.readAll)
     response.close()
     if not readOk or type(contents) ~= "string" or contents == "" then
-        drawBootScreen()
-        return
+        return fail("empty download")
     end
 
     contents = contents:gsub("^\239\187\191", "")
@@ -281,42 +931,52 @@ local function autoUpdateLauncher()
             currentContents = currentContents:gsub("^\239\187\191", "")
             currentContents = currentContents:gsub("\r\n", "\n"):gsub("\r", "\n")
             if contents == currentContents then
+                bootLog("Launcher is up to date")
+                bootStatus = "Launcher is up to date"
                 drawBootScreen()
+                sleep(1)
+                bootStatus = nil
                 return
             end
         end
     end
 
-    local compiled, compileError = loadstring(contents, "@launcher.lua")
+    local compiled, compileError = (loadstring or load)(contents, "@launcher.lua")
     if not compiled then
-        drawBootScreen()
-        return
+        return fail("host file invalid: " .. tostring(compileError))
+    end
+
+    local knownBad = readWholeFile(BAD_LAUNCHER_PATH)
+    if knownBad and (knownBad:gsub("\r\n", "\n"):gsub("\r", "\n")) == contents then
+        return fail("host version previously failed")
     end
 
     drawBootScreen()
+    fs.makeDir(RECOVERY_DIRECTORY)
+    if fs.exists(LAUNCHER_PATH) then
+        if fs.exists(GOOD_LAUNCHER_PATH) then fs.delete(GOOD_LAUNCHER_PATH) end
+        pcall(fs.copy, LAUNCHER_PATH, GOOD_LAUNCHER_PATH)
+    end
     local temporary = LAUNCHER_PATH .. ".update-tmp"
     local backup = LAUNCHER_PATH .. ".update-bak"
     if fs.exists(temporary) then fs.delete(temporary) end
     if fs.exists(backup) then fs.delete(backup) end
     local file = fs.open(temporary, "w")
     if not file then
-        drawBootScreen()
-        return
+        return fail("cannot write " .. temporary)
     end
     local wrote, writeError = pcall(file.write, contents)
     local closed, closeError = pcall(file.close)
     if not wrote or not closed then
         if fs.exists(temporary) then fs.delete(temporary) end
-        drawBootScreen()
-        return
+        return fail("write failed: " .. tostring(writeError or closeError))
     end
 
     if fs.exists(LAUNCHER_PATH) then
         local backedUp, backupError = pcall(fs.move, LAUNCHER_PATH, backup)
         if not backedUp then
             fs.delete(temporary)
-            drawBootScreen()
-            return
+            return fail("backup failed: " .. tostring(backupError))
         end
     end
 
@@ -324,11 +984,16 @@ local function autoUpdateLauncher()
     if not moved then
         if fs.exists(temporary) then fs.delete(temporary) end
         if fs.exists(backup) then pcall(fs.move, backup, LAUNCHER_PATH) end
-        drawBootScreen()
-        return
+        return fail("install failed: " .. tostring(moveError))
     end
     if fs.exists(backup) then fs.delete(backup) end
 
+    bootLog("Launcher updated (" .. #contents .. " bytes); rebooting")
+    local marker = fs.open(PENDING_BOOT_PATH, "w")
+    if marker then
+        marker.write("pending")
+        marker.close()
+    end
     drawBootScreen()
     if type(nativeOs.reboot) == "function" then nativeOs.reboot() end
 end
@@ -351,6 +1016,7 @@ local settings = {
     alphabetical = true,
     autoLoginUser = nil,
     autoLaunchPath = nil,
+    rift = {},
 }
 local encryptionKey
 local settingsNeedEncryption = false
@@ -530,7 +1196,6 @@ end
 local function createSystemEnvironment()
     local environment = {}
     for name, value in pairs(_ENV) do environment[name] = value end
-    environment.os = createProgramOs(nativeOs)
     environment.launcherTheme = getThemeInfo()
     return environment
 end
@@ -602,6 +1267,16 @@ local function loadSettings()
         and not saved.autoLaunchPath:find("..", 1, true) then
         settings.autoLaunchPath = saved.autoLaunchPath
     end
+    if type(saved.rift) == "table" then
+        settings.rift = {}
+        for key, value in pairs(saved.rift) do
+            local valueType = type(value)
+            if type(key) == "string" and #key <= 64
+                and (valueType == "string" or valueType == "number" or valueType == "boolean") then
+                settings.rift[key] = value
+            end
+        end
+    end
     applyTheme()
 end
 
@@ -657,6 +1332,53 @@ local function saveSettings()
     settingsNeedEncryption = false
     message = "Settings saved."
     return true
+end
+
+local riftApi = {
+    version = "1",
+    notify = notifyUser,
+    user = function() return currentUser end,
+    notifications = function()
+        local copy = {}
+        for index, entry in ipairs(notificationHistory) do copy[index] = entry.text end
+        return copy
+    end,
+    settings = {
+        get = function(key, default)
+            if type(key) ~= "string" then error("Setting name must be a string.", 2) end
+            local value = settings.rift[key]
+            if value == nil then return default end
+            return value
+        end,
+        set = function(key, value)
+            if type(key) ~= "string" or #key > 64 then error("Invalid setting name.", 2) end
+            local valueType = type(value)
+            if value ~= nil and valueType ~= "string" and valueType ~= "number"
+                and valueType ~= "boolean" then
+                error("Setting values must be strings, numbers or booleans.", 2)
+            end
+            settings.rift[key] = value
+            local previousMessage = message
+            local saved = saveSettings()
+            message = previousMessage
+            return saved
+        end,
+    },
+}
+rawset(_ENV, "rift", riftApi)
+rawset(_G, "rift", riftApi)
+
+idleLockMinutes = function()
+    local minutes = tonumber(settings.rift.idleLockMinutes)
+    return minutes and minutes > 0 and minutes or 0
+end
+bootLogoEnabled = function() return settings.rift.bootLogo ~= false end
+clockTime = function()
+    local offset = tonumber(settings.rift.timeZone)
+    if offset then
+        return textutils.formatTime((nativeOs.time("utc") + offset) % 24, true)
+    end
+    return textutils.formatTime(nativeOs.time("local"), true)
 end
 
 local function ensureStartupProgram()
@@ -827,39 +1549,29 @@ local function saveProfileAdmins(admins)
 end
 
 local function installDownloader()
-    local function useInstalledDownloader(err)
-        if fs.exists(DOWNLOADER_PATH) and not fs.isDir(DOWNLOADER_PATH) then return true end
-        return false, err
-    end
-
+    if fs.exists(DOWNLOADER_PATH) and fs.exists(SYSTEM_FILE_BROWSER_PATH) then return true end
     if not http or not http.get then
-        return useInstalledDownloader("Enable the ComputerCraft HTTP API to download the app downloader.")
+        return false, "Enable the ComputerCraft HTTP API to download the app downloader."
     end
 
     local ok, response, requestError = pcall(
         http.get, HOST_BASE_URL .. "computercraft/system/app-downloader.lua"
     )
-    if not ok then return useInstalledDownloader("Downloader request failed: " .. tostring(response)) end
+    if not ok then return false, "Downloader request failed: " .. tostring(response) end
     if not response then
-        return useInstalledDownloader("Downloader request failed: "
-            .. tostring(requestError or "HTTP request failed."))
+        return false, "Downloader request failed: " .. tostring(requestError or "HTTP request failed.")
     end
 
     local responseCode = response.getResponseCode and response.getResponseCode()
     if responseCode and responseCode ~= 200 then
         response.close()
-        return useInstalledDownloader("Downloader request failed: host returned HTTP "
-            .. responseCode .. ".")
+        return false, "Downloader request failed: host returned HTTP " .. responseCode .. "."
     end
 
     local contents = response.readAll()
     response.close()
     if not contents or contents == "" then
-        return useInstalledDownloader("Downloader download failed: the file was empty.")
-    end
-    local compiled, compileError = loadstring(contents, "@app-downloader.lua")
-    if not compiled then
-        return useInstalledDownloader("Downloader download failed: " .. tostring(compileError))
+        return false, "Downloader download failed: the file was empty."
     end
 
     local temporary = DOWNLOADER_PATH .. ".download-tmp"
@@ -868,27 +1580,22 @@ local function installDownloader()
     if fs.exists(temporary) then fs.delete(temporary) end
     if fs.exists(backup) then fs.delete(backup) end
     local file = fs.open(temporary, "w")
-    if not file then return useInstalledDownloader("Could not create " .. temporary .. ".") end
-    local wrote, writeError = pcall(file.write, contents)
-    local closed, closeError = pcall(file.close)
-    if not wrote or not closed then
-        if fs.exists(temporary) then fs.delete(temporary) end
-        return useInstalledDownloader("Could not write the app downloader: "
-            .. tostring(not wrote and writeError or closeError))
-    end
+    if not file then return false, "Could not create " .. temporary .. "." end
+    file.write(contents)
+    file.close()
 
     if fs.exists(DOWNLOADER_PATH) then
         local backedUp, backupError = pcall(fs.move, DOWNLOADER_PATH, backup)
         if not backedUp then
             fs.delete(temporary)
-            return useInstalledDownloader("Could not back up the app downloader: " .. tostring(backupError))
+            return false, "Could not back up the app downloader: " .. tostring(backupError)
         end
     end
     local moved, moveError = pcall(fs.move, temporary, DOWNLOADER_PATH)
     if not moved then
         if fs.exists(temporary) then fs.delete(temporary) end
         if fs.exists(backup) then fs.move(backup, DOWNLOADER_PATH) end
-        return useInstalledDownloader("Could not install the app downloader: " .. tostring(moveError))
+        return false, "Could not install the app downloader: " .. tostring(moveError)
     end
     if fs.exists(backup) then fs.delete(backup) end
     return true
@@ -901,7 +1608,7 @@ local function displayName(path)
     end)
 end
 
-local function chooseUser(skipAutoLogin)
+local function chooseUserPrompt(skipAutoLogin)
     fs.makeDir(USER_ROOT)
     local loadedPasswords, passwordError, passwordsEncrypted = loadProfilePasswords()
     if not loadedPasswords then error(passwordError, 0) end
@@ -1130,6 +1837,15 @@ local function chooseUser(skipAutoLogin)
     end
 end
 
+local function chooseUser(skipAutoLogin)
+    local previous = sessionMenuAllowed
+    sessionMenuAllowed = false
+    local result = table.pack(pcall(chooseUserPrompt, skipAutoLogin))
+    sessionMenuAllowed = previous
+    if not result[1] then error(result[2], 0) end
+    return table.unpack(result, 2, result.n)
+end
+
 local function authorizeProfileAccess(username, profileContext)
     local accessingUser = profileContext and profileContext.user or currentUser
     local passwords = profileContext and profileContext.passwords or profilePasswords
@@ -1270,8 +1986,7 @@ local function refreshApps()
     fs.makeDir(SYSTEM_APP_DIRECTORY)
     for _, name in ipairs(fs.list(SYSTEM_APP_DIRECTORY)) do
         local path = fs.combine(SYSTEM_APP_DIRECTORY, name)
-        if isLuaFile(path) and path ~= SYSTEM_CLOUD_PATH
-            and fs.getName(path):lower() ~= "cloud.lua" and not available[path] then
+        if isLuaFile(path) and not available[path] then
             table.insert(available, {
                 path = path,
                 name = catalogNames[name] or displayName(name),
@@ -1304,7 +2019,7 @@ local function refreshApps()
     local function addAppsFrom(directory, includeLegacyRoot)
         for _, name in ipairs(fs.list(directory)) do
             local fullPath = fs.combine(directory, name)
-            if isLuaFile(fullPath) and fs.getName(fullPath):lower() ~= "cloud.lua"
+            if isLuaFile(fullPath)
                 and not available[fullPath]
                 and (not includeLegacyRoot or name ~= "launcher.lua" and name ~= "app-downloader.lua"
                     and not fs.exists(fs.combine(appDirectory, name))) then
@@ -1383,44 +2098,130 @@ local function draw()
     term.clear()
     term.setCursorPos(1, 1)
     term.setBackgroundColor(titleColor)
-    term.write((" RIFT LAUNCHER - " .. tostring(currentUser)):sub(1, width))
+    term.setTextColor(isColor and colors.black or colors.white)
+    term.write(string.rep(" ", width))
+    term.setCursorPos(2, 1)
+    term.write(("RIFT LAUNCHER"):sub(1, width - 1))
+    local rightText = tostring(currentUser) .. "  " .. clockTime()
+    if #rightText + 17 <= width then
+        term.setCursorPos(width - #rightText, 1)
+        term.write(rightText)
+    end
     term.setBackgroundColor(backgroundColor)
     term.setCursorPos(2, 2)
     term.setTextColor(mutedColor)
-    term.write("YOUR PROGRAMS":sub(1, math.max(0, width - 2)))
+    local countText = "  (" .. #apps .. ")"
+    term.write(("YOUR PROGRAMS" .. countText):sub(1, math.max(0, width - 2)))
+    term.setCursorPos(1, 3)
+    term.setTextColor(isColor and theme.accent or colors.gray)
+    term.write(string.rep("-", width))
 
     local lastVisible = math.min(#apps, firstVisible + visibleRows - 1)
     for index = firstVisible, lastVisible do
         local row = index - firstVisible + 4
-        term.setCursorPos(2, row)
+        term.setCursorPos(1, row)
         if index == selected then
             term.setBackgroundColor(highlightColor)
             term.setTextColor(textColor)
-            term.write(("  > " .. apps[index].name):sub(1, math.max(0, width - 2)))
+            term.write((" > " .. apps[index].name .. string.rep(" ", width)):sub(1, width))
             term.setBackgroundColor(backgroundColor)
         else
             term.setTextColor(textColor)
-            term.write(("    " .. apps[index].name):sub(1, math.max(0, width - 2)))
+            term.write(("   " .. apps[index].name):sub(1, width))
         end
+    end
+    if #apps == 0 then
+        term.setCursorPos(3, 4)
+        term.setTextColor(mutedColor)
+        term.write(("No programs yet. Open the App Downloader."):sub(1, math.max(0, width - 2)))
+    end
+    term.setTextColor(mutedColor)
+    if firstVisible > 1 then
+        term.setCursorPos(width, 4)
+        term.write("^")
+    end
+    if lastVisible < #apps then
+        term.setCursorPos(width, 3 + visibleRows)
+        term.write("v")
     end
     firstButtons = {
         { label = "UPDATE", action = "update" },
-        { label = "OPEN TAB", action = "tab" },
         { label = "SETTINGS", action = "settings" },
     }
     secondButtons = {
-        { label = "SWITCH USER", action = "user" },
         { label = "REFRESH", action = "refresh" },
+        { label = "ALERTS (" .. #notificationHistory .. ")", action = "alerts" },
     }
+    if #tasks > 0 then
+        table.insert(secondButtons, { label = "TASKS (" .. #tasks .. ")", action = "tasks" })
+    end
+    term.setCursorPos(1, height - 5)
+    term.setTextColor(isColor and theme.accent or colors.gray)
+    term.write(string.rep("-", width))
     drawButtons(firstButtons, height - 2, width, isColor)
     drawButtons(secondButtons, height - 1, width, isColor)
 
     term.setCursorPos(2, height - 4)
     term.setTextColor(mutedColor)
-    term.write(displayLauncherMessage(message):sub(1, math.max(0, width - 2)))
+    local footer = displayLauncherMessage(message)
+    if footer == "" then footer = "Click twice or press Enter to open. Ctrl+T for the menu." end
+    term.write(footer:sub(1, math.max(0, width - 2)))
     term.setBackgroundColor(backgroundColor)
     term.setTextColor(textColor)
     return firstButtons, secondButtons
+end
+
+local function showNotifications()
+    local scroll = 0
+    while true do
+        local width, height = term.getSize()
+        local isColor = term.isColor()
+        local theme = THEMES[settings.theme]
+        term.setBackgroundColor(colors.black)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.setBackgroundColor(isColor and theme.accent or colors.gray)
+        term.setTextColor(isColor and colors.black or colors.white)
+        term.write((" NOTIFICATIONS" .. string.rep(" ", width)):sub(1, width))
+        term.setBackgroundColor(colors.black)
+        local rows = math.max(1, height - 3)
+        local total = #notificationHistory
+        scroll = math.max(0, math.min(scroll, math.max(0, total - rows)))
+        if total == 0 then
+            term.setCursorPos(2, 3)
+            term.setTextColor(colors.lightGray)
+            term.write("Nothing yet.")
+        end
+        for row = 1, math.min(rows, total) do
+            local entry = notificationHistory[total - scroll - row + 1]
+            if not entry then break end
+            term.setCursorPos(2, row + 2)
+            term.setTextColor(colors.lightGray)
+            term.write(textutils.formatTime(entry.time, true) .. " ")
+            term.setTextColor(colors.white)
+            local used = #textutils.formatTime(entry.time, true) + 2
+            term.write(entry.text:sub(1, math.max(0, width - used - 1)))
+        end
+        term.setCursorPos(2, height)
+        term.setTextColor(colors.lightGray)
+        term.write(("Up/Down scroll   C clear   any other key closes"):sub(1, width - 2))
+        local event, button = os.pullEventRaw()
+        if event == "key" then
+            if button == keys.up then
+                scroll = scroll + 1
+            elseif button == keys.down then
+                scroll = scroll - 1
+            elseif button == keys.c then
+                for index = #notificationHistory, 1, -1 do notificationHistory[index] = nil end
+            else
+                return
+            end
+        elseif event == "mouse_scroll" then
+            scroll = scroll - button
+        elseif event == "mouse_click" then
+            return
+        end
+    end
 end
 
 local function waitForReturn(waitForKey)
@@ -1456,14 +2257,14 @@ local function updateSelected()
     term.setTextColor(colors.white)
     term.clear()
     term.setCursorPos(1, 1)
-    local ok, result = pcall(os.run, _ENV, DOWNLOADER_PATH, "update", fs.getName(app.path), homeDirectory)
+    nextTaskName = "Update"
+    local ok, result = runClosable(os.run, _ENV, DOWNLOADER_PATH, "update", fs.getName(app.path), homeDirectory)
     if not ok then
         printError("Could not run the app downloader: " .. tostring(result))
     elseif result == false then
         printError("The app downloader did not complete successfully.")
     end
     waitForReturn(not ok or result == false)
-    shiftDown = false
     refreshApps()
     message = ""
 end
@@ -1473,6 +2274,22 @@ local function isInHomeDirectory(path)
     local normalizedHome = homeDirectory:gsub("^/+", ""):gsub("/+$", "")
     return normalizedPath == normalizedHome
         or normalizedPath:sub(1, #normalizedHome + 1) == normalizedHome .. "/"
+end
+
+-- os.run reports failures through the real global printError, so hook both it and ours.
+local function capturePrintError(sink)
+    local previousGlobal = _G.printError
+    local previousLocal = printError
+    local function hook(text)
+        sink(tostring(text))
+        previousGlobal(text)
+    end
+    _G.printError = hook
+    printError = hook
+    return function()
+        _G.printError = previousGlobal
+        printError = previousLocal
+    end
 end
 
 local function runHomeProgram(programPath, profileContext, ...)
@@ -1826,9 +2643,6 @@ local function runHomeProgram(programPath, profileContext, ...)
 
         local sandboxOs = {}
         for name, value in pairs(nativeOs) do sandboxOs[name] = value end
-        local programOs = createProgramOs(nativeOs)
-        sandboxOs.pullEvent = programOs.pullEvent
-        sandboxOs.pullEventRaw = programOs.pullEventRaw
         sandboxOs.loadAPI = nil
         sandboxOs.unloadAPI = nil
         local currentEnvironment = environment
@@ -1882,7 +2696,35 @@ local function runHomeProgram(programPath, profileContext, ...)
         environment.shell = sandboxShell
         environment.launcherTheme = getThemeInfo()
         local storageModule = createStorageModule()
-        environment.storage = storageModule
+        -- Each sandbox gets its own rift table so rift.storage is bound to this profile.
+        local sandboxRift = {}
+        for name, value in pairs(riftApi) do sandboxRift[name] = value end
+        sandboxRift.storage = storageModule
+        sandboxRift.notify = function(text, options)
+            local merged = {}
+            if type(options) == "table" then
+                for key, value in pairs(options) do merged[key] = value end
+            end
+            merged.app = riftModules.appName()
+            return notifyUser(text, merged)
+        end
+        sandboxRift.ui = riftModules.ui()
+        sandboxRift.account = riftModules.account(storageModule, sandboxRift.ui)
+        sandboxRift.permissions = {
+            has = function(capability)
+                local key = tostring(currentUser) .. ":cap:" .. tostring(capability)
+                local saved = bgServices.permissions()[key]
+                return saved == true or riftModules.sessionGrants[key] == true
+            end,
+            request = function(capability, label)
+                return riftModules.check(tostring(capability), label, riftModules.appName())
+            end,
+            revoke = function(capability) riftModules.revoke(tostring(capability)) end,
+            list = riftModules.list,
+        }
+        environment.peripheral = riftModules.peripheral()
+        environment.rift = sandboxRift
+        environment.storage = sandboxRift.storage
         environment._G = environment
         environment.debug = nil
         environment.package = packageState
@@ -1912,7 +2754,11 @@ local function runHomeProgram(programPath, profileContext, ...)
             end
 
             if moduleName == "package" then return packageState end
-            if moduleName == "storage" then
+            if moduleName == "storage" or moduleName == "rift" then
+                if moduleName == "rift" then
+                    packageState.loaded.rift = sandboxRift
+                    return sandboxRift
+                end
                 packageState.loaded.storage = storageModule
                 return storageModule
             end
@@ -1962,198 +2808,1279 @@ local function runHomeProgram(programPath, profileContext, ...)
 
     local environment = createEnvironment(_ENV, virtualProgram)
     local target = nativeFs.combine(homeDirectory, virtualProgram)
-    if launchHomeProgramInTab then
-        return nativeMultishell.launch(environment, target, ...)
-    end
     return nativeOs.run(environment, target, ...)
 end
 
-local function createProfileCloudRunner(profileContext)
-    return function(command, ...)
-        if type(command) ~= "string" or command:find("[%c:]") then
-            return false, "Invalid program path."
-        end
-        local normalized = command:gsub("\\", "/"):gsub("^/+", "")
-        local candidates = {}
-        local function addCandidate(path)
-            local candidate = nativeFs.combine(profileContext.homeDirectory, path)
-            if isInHomeDirectory(candidate) then
-                candidates[#candidates + 1] = candidate
-                if not candidate:lower():match("%.lua$") then
-                    candidates[#candidates + 1] = candidate .. ".lua"
-                end
-            end
-        end
-        addCandidate(normalized)
-        if not normalized:find("/", 1, true) then
-            addCandidate("apps/" .. normalized)
-            addCandidate("shell/" .. normalized)
-        end
-        for _, candidate in ipairs(candidates) do
-            if nativeFs.exists(candidate) and not nativeFs.isDir(candidate)
-                and candidate:lower():match("%.lua$") then
-                local ok, result = pcall(runHomeProgram, candidate, profileContext, ...)
-                if not ok then return false, tostring(result) end
-                return result
-            end
-        end
-        return false, "Program not found in the active profile home."
-    end
+-- Background services, modelled on Windows services: each is installed with a display name,
+-- a startup type (automatic, manual or disabled) and a recovery action, then started and
+-- stopped by name. They run headless with no window, focus or input events.
+local START_TYPES = { automatic = true, manual = true, disabled = true }
+
+bgServices.configPath = function()
+    return homeDirectory and (homeDirectory .. "/.services.json")
 end
 
-local function resumeCloudService(...)
-    if not cloudService then return end
-    local ok, yielded = coroutine.resume(cloudService, ...)
-    if not ok then
-        reportCloudServiceError(yielded)
-        cloudService = nil
-        cloudServiceFilter = nil
-        if cloudServicePreviousTerm then term.redirect(cloudServicePreviousTerm) end
-        cloudServicePreviousTerm = nil
-        cloudServiceTerminal = nil
-        cloudServiceCode = nil
-        cloudServiceErrorPath = nil
-    elseif coroutine.status(cloudService) == "dead" then
-        cloudService = nil
-        cloudServiceFilter = nil
-        if cloudServicePreviousTerm then term.redirect(cloudServicePreviousTerm) end
-        cloudServicePreviousTerm = nil
-        cloudServiceTerminal = nil
-        if yielded == false then
-            cloudServiceStatus = cloudServiceStatus or "Stopped with an error; check the terminal output."
-        else
-            cloudServiceStatus = "Connection ended."
-        end
-        message = "Cloud Catcher: " .. cloudServiceStatus
-        cloudServiceCode = nil
-        cloudServiceErrorPath = nil
-    else
-        cloudServiceFilter = yielded
-    end
+bgServices.load = function()
+    local path = bgServices.configPath()
+    if not path or not fs.exists(path) then return {} end
+    local handle = fs.open(path, "r")
+    if not handle then return {} end
+    local contents = handle.readAll()
+    handle.close()
+    local ok, data = pcall(textutils.unserializeJSON, contents)
+    return ok and type(data) == "table" and data or {}
 end
 
-pullEventWithCloud = function(filter, raw, allowTerminate)
-    while true do
-        local eventSource = allowTerminate and unfilteredPullEventRaw or nativePullEventRaw
-        local event = table.pack(eventSource())
-        if cloudService and coroutine.running() ~= cloudService
-            and (cloudServiceFilter == nil or cloudServiceFilter == event[1] or event[1] == "terminate") then
-            resumeCloudService(table.unpack(event, 1, event.n))
-        end
-        if event[1] == "terminate" and allowTerminate then error("Terminated", 0) end
-        if filter == nil or event[1] == filter then
-            if event[1] == "terminate" and not raw then error("Terminated", 0) end
-            return table.unpack(event, 1, event.n)
-        end
-        if event[1] == "terminate" and not raw then error("Terminated", 0) end
-    end
-end
-
-nativeOs.pullEvent = function(filter)
-    return pullEventWithCloud(filter, false, false)
-end
-nativeOs.pullEventRaw = function(filter)
-    return pullEventWithCloud(filter, true, false)
-end
-
-local function startCloudService(code, profileContext)
-    if cloudService then return false, "Cloud Catcher is already running." end
-    cloudServiceStatus = nil
-    cloudServiceCode = code
-    local errorPath = nativeFs.combine(profileContext.homeDirectory, "cloud-catcher-error.txt")
-    local suffix = 1
-    while nativeFs.exists(errorPath) do
-        errorPath = nativeFs.combine(profileContext.homeDirectory,
-            "cloud-catcher-error-" .. suffix .. ".txt")
-        suffix = suffix + 1
-    end
-    cloudServiceErrorPath = errorPath
-    cloudServicePreviousTerm = term.current()
-    local environment = createSystemEnvironment()
-    environment.profileHomeDirectory = profileContext.homeDirectory
-    environment.cloudMirrorParentTerm = cloudServicePreviousTerm
-    environment.cloudMirrorMode = true
-    environment.cloudMirrorStatus = function(status)
-        cloudServiceStatus = status
-        message = "Cloud Catcher: " .. status
-    end
-    local cloudOs = {}
-    for name, value in pairs(nativeOs) do cloudOs[name] = value end
-    cloudOs.pullEvent = nativePullEvent
-    cloudOs.pullEventRaw = nativePullEventRaw
-    environment.os = cloudOs
-    environment.cloudRunProgram = createProfileCloudRunner(profileContext)
-    environment.cloudRemoteEvent = function(...)
-        nativeOs.queueEvent(...)
-    end
-    local cloudShell = {}
-    for name, value in pairs(shell) do cloudShell[name] = value end
-    cloudShell.run = nil
-    cloudShell.execute = nil
-    environment.shell = cloudShell
-
-    local previousDirectory = shell.dir()
-    shell.setDir(profileContext.homeDirectory)
-    cloudService = coroutine.create(function()
-        setmetatable(environment, { __index = _G })
-        if nativeSettingsApi and nativeSettingsApi.get
-            and nativeSettingsApi.get("bios.strict_globals", false) then
-            environment._ENV = environment
-            getmetatable(environment).__newindex = function(_, name)
-                error("Attempt to create global " .. tostring(name), 2)
-            end
-        end
-        local program, loadError = nativeLoadfile(SYSTEM_CLOUD_PATH, nil, environment)
-        if not program then
-            reportCloudServiceError(loadError)
-            return false
-        end
-        local ok, result = pcall(program, code)
-        if not ok then
-            reportCloudServiceError(result)
-            return false
-        end
-        return true, result
-    end)
-    local started = table.pack(coroutine.resume(cloudService))
-    shell.setDir(previousDirectory)
-    if not started[1] then
-        reportCloudServiceError(started[2])
-        cloudService = nil
-        cloudServicePreviousTerm = nil
-        cloudServiceTerminal = nil
-        cloudServiceCode = nil
-        cloudServiceErrorPath = nil
-        return false, tostring(started[2])
-    end
-    if started[2] ~= "cloud_mirror_terminal" or type(started[3]) ~= "table" then
-        local startError = cloudServiceStatus or "Cloud Catcher did not provide its screen-mirror terminal."
-        cloudService = nil
-        cloudServicePreviousTerm = nil
-        cloudServiceTerminal = nil
-        cloudServiceCode = nil
-        cloudServiceErrorPath = nil
-        return false, startError
-    end
-    cloudServiceTerminal = createCloudMirrorTerminal(cloudServicePreviousTerm, started[3])
-    restoreCloudMirrorTerminal()
-    cloudServiceFilter = "cloud_catcher_start"
-    nativeOs.queueEvent(cloudServiceFilter)
+bgServices.save = function(config)
+    local path = bgServices.configPath()
+    if not path then return false end
+    local handle = fs.open(path, "w")
+    if not handle then return false end
+    handle.write(textutils.serializeJSON(config))
+    handle.close()
     return true
 end
 
-local function launchSelected(openInTab)
+bgServices.find = function(name)
+    for _, service in ipairs(bgServices.list) do
+        if service.name == name then return service end
+    end
+end
+
+bgServices.remove = function(service)
+    for index, candidate in ipairs(bgServices.list) do
+        if candidate == service then
+            table.remove(bgServices.list, index)
+            return
+        end
+    end
+end
+
+bgServices.resume = function(service, event)
+    local previousTerm = term.current()
+    local previousChain = inAppChain
+    inAppChain = true
+    term.redirect(service.window)
+    local previousQuiet = bgServices.quiet
+    local previousHosting = bgServices.hosting
+    local previousApp = bgServices.currentApp
+    bgServices.hosting = service.isHost and service or nil
+    bgServices.currentApp = service.appPath or previousApp
+    bgServices.quiet = true
+    local packed = table.pack(coroutine.resume(service.co, table.unpack(event, 1, event.n)))
+    bgServices.currentApp = previousApp
+    bgServices.hosting = previousHosting
+    bgServices.quiet = previousQuiet
+    term.redirect(previousTerm)
+    inAppChain = previousChain
+    service.filter = packed[2]
+    if coroutine.status(service.co) == "dead" then
+        service.finished = true
+        service.packed = packed
+    end
+end
+
+-- Last non-blank line the service printed; its only way to say why it failed.
+bgServices.lastOutput = function(service)
+    local _, height = service.window.getSize()
+    for row = height, 1, -1 do
+        local ok, line = pcall(service.window.getLine, row)
+        if ok and type(line) == "string" and line:match("%S") then
+            return (line:gsub("%s+$", ""))
+        end
+    end
+end
+
+bgServices.finish = function(service)
+    bgServices.remove(service)
+    if service.stopping then return end
+    local failed = service.packed[1] == false or service.packed[2] == false
+    if not failed then
+        bgServices.status[service.name] = "Stopped"
+        bootLog("SERVICE " .. service.name .. " stopped by itself")
+        return
+    end
+    local detail = tostring(service.packed[1] == false and service.packed[2] or bgServices.lastOutput(service) or "unknown error")
+    bgServices.status[service.name] = "Failed: " .. detail
+    bootLog("SERVICE " .. service.name .. " failed: " .. detail)
+    notifyUser(service.display .. " service failed: " .. detail)
+    local entry = bgServices.load()[service.name]
+    local crashes = (bgServices.crashes[service.name] or 0) + 1
+    bgServices.crashes[service.name] = crashes
+    -- Recovery action "restart" retries with a growing delay, giving up after five failures.
+    if entry and entry.recovery == "restart" and entry.startType ~= "disabled" and crashes <= 5 then
+        local timer = nativeOs.startTimer(5 * 2 ^ (crashes - 1))
+        bgServices.restarts[timer] = service.name
+    end
+end
+
+bgServices.launch = function(name, entry)
+    if bgServices.find(name) then return false, "Service is already running." end
+    if not homeDirectory then return false, "Nobody is signed in." end
+    if not window or not window.create then return false, "Windows are unavailable." end
+    local physical = fs.combine(homeDirectory, entry.path)
+    if not fs.exists(physical) or fs.isDir(physical) then
+        bgServices.status[name] = "Failed: program not found"
+        return false, "Program not found: " .. tostring(entry.path)
+    end
+    local width, height = term.native().getSize()
+    local service = {
+        name = name,
+        display = entry.displayName or name,
+        co = coroutine.create(runHomeProgram),
+        window = window.create(term.native(), 1, 1, width, height, false),
+    }
+    local context = {
+        user = currentUser,
+        homeDirectory = homeDirectory,
+        passwords = profilePasswords,
+        admins = profileAdmins,
+        authorized = authorizedProfiles,
+    }
+    bgServices.list[#bgServices.list + 1] = service
+    bgServices.status[name] = "Running"
+    bootLog("SERVICE " .. name .. " starting (" .. tostring(entry.path) .. ")")
+    bgServices.resume(service, table.pack(physical, context, homeDirectory))
+    if service.finished then bgServices.finish(service) end
+    return true
+end
+
+-- Runs a Lua function as a headless service. It lives until it ends, is stopped, or the user signs out.
+bgServices.spawn = function(name, fn, displayName)
+    if bgServices.find(name) then return false, "Service is already running." end
+    if not window or not window.create then return false, "Windows are unavailable." end
+    local width, height = term.native().getSize()
+    local service = {
+        name = name,
+        display = displayName or name,
+        co = coroutine.create(fn),
+        window = window.create(term.native(), 1, 1, width, height, false),
+        spawned = true,
+    }
+    bgServices.list[#bgServices.list + 1] = service
+    bgServices.status[name] = "Running"
+    bootLog("SERVICE " .. name .. " spawned from function")
+    bgServices.resume(service, table.pack())
+    if service.finished then bgServices.finish(service) end
+    return true
+end
+
+bgServices.stop = function(name, quiet)
+    local service = bgServices.find(name)
+    for timer, pendingName in pairs(bgServices.restarts) do
+        if pendingName == name then bgServices.restarts[timer] = nil end
+    end
+    if not service then return false, "Service is not running." end
+    service.stopping = true
+    service.finished = true
+    bgServices.remove(service)
+    bgServices.status[name] = "Stopped"
+    if not quiet then bootLog("SERVICE " .. name .. " stopped") end
+    return true
+end
+
+bgServices.stopAll = function()
+    for index = #bgServices.list, 1, -1 do
+        bgServices.stop(bgServices.list[index].name, true)
+    end
+    bgServices.list = {}
+    bgServices.restarts = {}
+    bgServices.crashes = {}
+    bgServices.status = {}
+    bgServices.endpoints = {}
+end
+
+-- Persisted services cannot save their function, so the app that spawned them is re-run hidden
+-- after sign-in. Once it spawns the service again, the hidden host is discarded.
+bgServices.persistPrefix = function()
+    return "persist:" .. tostring(currentUser) .. ":"
+end
+
+bgServices.launchHost = function(name, record)
+    if bgServices.find(name) or bgServices.find("host:" .. name) then return end
+    local path = type(record) == "table" and record.path
+    if type(path) ~= "string" or not isInHomeDirectory(path) or not fs.exists(path) or fs.isDir(path) then
+        bootLog("SERVICE " .. name .. " persisted app is missing; not restored")
+        return
+    end
+    local width, height = term.native().getSize()
+    local service = {
+        name = "host:" .. name,
+        hostFor = name,
+        display = tostring(record.displayName or name),
+        isHost = true,
+        appPath = path,
+        deadline = nativeOs.clock() + 30,
+        co = coroutine.create(runHomeProgram),
+        window = window.create(term.native(), 1, 1, width, height, false),
+    }
+    local context = {
+        user = currentUser,
+        homeDirectory = homeDirectory,
+        passwords = profilePasswords,
+        admins = profileAdmins,
+        authorized = authorizedProfiles,
+    }
+    bgServices.list[#bgServices.list + 1] = service
+    bootLog("SERVICE " .. name .. " restoring via " .. path)
+    bgServices.resume(service, table.pack(path, context, homeDirectory))
+    if service.finished then bgServices.finish(service) end
+end
+
+bgServices.startAutomatic = function()
+    if not homeDirectory then return end
+    local names = {}
+    for name, entry in pairs(bgServices.load()) do
+        if entry.startType == "automatic" then names[#names + 1] = name end
+    end
+    table.sort(names)
+    local config = bgServices.load()
+    for _, name in ipairs(names) do
+        local ok, reason = bgServices.launch(name, config[name])
+        if not ok then bootLog("SERVICE " .. name .. " did not start: " .. tostring(reason)) end
+    end
+    local prefix = bgServices.persistPrefix()
+    local persisted = {}
+    for key, value in pairs(bgServices.permissions()) do
+        if key:sub(1, #prefix) == prefix and type(value) == "table" then
+            persisted[#persisted + 1] = key:sub(#prefix + 1)
+        end
+    end
+    table.sort(persisted)
+    local permissions = bgServices.permissions()
+    for _, name in ipairs(persisted) do
+        bgServices.launchHost(name, permissions[prefix .. name])
+    end
+end
+
+bgServices.pump = function(event)
+    local name = event[1]
+    if rawInputEvents[name] or (type(name) == "string" and (name:sub(1, 5) == "rift_"
+        or name == "session_action" or name == "menu_closed")) then
+        return
+    end
+    for _, service in ipairs({ table.unpack(bgServices.list) }) do
+        if service.isHost and not service.finished and nativeOs.clock() > service.deadline then
+            bootLog("SERVICE " .. tostring(service.hostFor) .. " restore timed out")
+            bgServices.stop(service.name, true)
+        end
+    end
+    if name == "timer" and bgServices.restarts[event[2]] then
+        local serviceName = bgServices.restarts[event[2]]
+        bgServices.restarts[event[2]] = nil
+        local entry = bgServices.load()[serviceName]
+        if entry and entry.startType ~= "disabled" then bgServices.launch(serviceName, entry) end
+        return
+    end
+    for _, service in ipairs({ table.unpack(bgServices.list) }) do
+        if not service.finished and (service.filter == nil or service.filter == name) then
+            bgServices.resume(service, event)
+            if service.finished then bgServices.finish(service) end
+        end
+    end
+end
+
+bgServices.permissionPath = SYSTEM_DIRECTORY .. "/system/service-permissions.json"
+
+-- Permissions live outside the profile so apps cannot grant themselves access.
+bgServices.permissions = function()
+    if not fs.exists(bgServices.permissionPath) then return {} end
+    local handle = fs.open(bgServices.permissionPath, "r")
+    if not handle then return {} end
+    local contents = handle.readAll()
+    handle.close()
+    local ok, data = pcall(textutils.unserializeJSON, contents)
+    return ok and type(data) == "table" and data or {}
+end
+
+bgServices.remember = function(key, allowed)
+    local data = bgServices.permissions()
+    data[key] = allowed
+    pcall(fs.makeDir, SYSTEM_DIRECTORY .. "/system")
+    local handle = fs.open(bgServices.permissionPath, "w")
+    if handle then
+        handle.write(textutils.serializeJSON(data))
+        handle.close()
+    end
+end
+
+-- Draws a Y/A/N/D permission box over the screen and returns "once", "always", "no" or "never".
+bgServices.prompt = function(lines)
+    local screen = term.native()
+    local deferred, answer = {}, nil
+    local previousBlink = term.getCursorBlink()
+    local function render()
+        local width, height = screen.getSize()
+        local boxWidth = math.min(width, 28)
+        local boxHeight = math.min(height, #lines + 2)
+        local left = math.floor((width - boxWidth) / 2) + 1
+        local top = math.max(1, math.floor((height - boxHeight) / 2) + 1)
+        screen.setCursorBlink(false)
+        for row = 0, boxHeight - 1 do
+            screen.setCursorPos(left, top + row)
+            screen.setBackgroundColor(colors.gray)
+            screen.setTextColor(colors.white)
+            screen.write(string.rep(" ", boxWidth))
+        end
+        for index, text in ipairs(lines) do
+            if top + index <= top + boxHeight - 1 then
+                screen.setCursorPos(left + 1, top + index)
+                screen.setTextColor(index == 1 and colors.yellow or colors.white)
+                screen.write(text:sub(1, boxWidth - 2))
+            end
+        end
+    end
+    while answer == nil do
+        render()
+        local event = table.pack(unfilteredPullEventRaw())
+        if event[1] == "key" then
+            local code = event[2]
+            if code == keys.y then answer = "once"
+            elseif code == keys.a then answer = "always"
+            elseif code == keys.n or code == keys.escape then answer = "no"
+            elseif code == keys.d then answer = "never" end
+        elseif event[1] == "terminate" then
+            answer = "no"
+        elseif not rawInputEvents[event[1]] and #deferred < 200 then
+            deferred[#deferred + 1] = event
+        end
+    end
+    screen.setCursorBlink(previousBlink)
+    for _, event in ipairs(deferred) do
+        nativeOs.queueEvent(table.unpack(event, 1, event.n))
+    end
+    nativeOs.queueEvent("term_resize")
+    return answer
+end
+
+-- Asks the user to allow a background service. Returns true or false.
+bgServices.ask = function(name, displayName, persist)
+    local key = tostring(currentUser) .. ":" .. name
+    local saved = bgServices.permissions()[key]
+    if saved ~= nil then return saved == true end
+    -- Background code has no input focus, so it can only use a stored decision.
+    if bgServices.quiet or screenLocked or not sessionMenuAllowed then
+        bootLog("SERVICE " .. name .. " denied: no stored permission and cannot ask")
+        return false
+    end
+    local answer = bgServices.prompt({
+        "BACKGROUND SERVICE",
+        "",
+        "An app wants to run",
+        tostring(displayName),
+        persist and "in the background, and" or "in the background.",
+        persist and "restart it after reboot." or "",
+        "Y Allow once   A Always",
+        "N Deny         D Never",
+    })
+    bootLog("SERVICE permission for " .. name .. ": " .. answer)
+    -- A persistent service only works after reboot with a stored decision, so "once" becomes "always".
+    if persist and answer == "once" then answer = "always" end
+    if answer == "always" then bgServices.remember(key, true) end
+    if answer == "never" then bgServices.remember(key, false) end
+    return answer == "once" or answer == "always"
+end
+
+-- Capability permissions (peripherals, notifications): stored per user, outside the profile.
+riftModules.sessionGrants = {}
+riftModules.check = function(capability, label, appName)
+    local key = tostring(currentUser) .. ":cap:" .. capability
+    local saved = bgServices.permissions()[key]
+    if saved ~= nil then return saved == true end
+    if riftModules.sessionGrants[key] ~= nil then return riftModules.sessionGrants[key] end
+    if bgServices.quiet or screenLocked or not sessionMenuAllowed then
+        bootLog("PERMISSION " .. capability .. " denied: no stored decision and cannot ask")
+        return false
+    end
+    local answer = bgServices.prompt({
+        "PERMISSION REQUEST",
+        "",
+        tostring(appName or "An app") .. " wants to use",
+        tostring(label or capability),
+        "",
+        "Y Allow once   A Always",
+        "N Deny         D Never",
+    })
+    bootLog("PERMISSION " .. capability .. " for " .. tostring(appName) .. ": " .. answer)
+    if answer == "always" then bgServices.remember(key, true) end
+    if answer == "never" then bgServices.remember(key, false) end
+    local allowed = answer == "once" or answer == "always"
+    -- "Once" lasts for the session so an app is not asked again on every call; "no" is asked again later.
+    if allowed then riftModules.sessionGrants[key] = true end
+    return allowed
+end
+
+riftModules.revoke = function(capability)
+    local key = tostring(currentUser) .. ":cap:" .. capability
+    riftModules.sessionGrants[key] = nil
+    bgServices.remember(key, nil)
+end
+
+riftModules.list = function()
+    local result, prefix = {}, tostring(currentUser) .. ":cap:"
+    for key, value in pairs(bgServices.permissions()) do
+        if key:sub(1, #prefix) == prefix then
+            result[#result + 1] = { capability = key:sub(#prefix + 1), allowed = value == true }
+        end
+    end
+    table.sort(result, function(a, b) return a.capability < b.capability end)
+    return result
+end
+
+-- Shared Rift account client: one sign-in used by every app (per profile storage).
+riftModules.account = function(store, ui)
+    local ACCOUNT_FILE, LEGACY_FILE = "rift/account.json", "rift-jobs/login.json"
+    local state = { user = nil }
+    local api = {}
+    local marketFields = { deliveryAddresses = true, providerAddress = true }
+
+    local function load()
+        for _, path in ipairs({ ACCOUNT_FILE, LEGACY_FILE }) do
+            local ok, data = pcall(store.read, path)
+            if ok and type(data) == "table" and type(data.username) == "string" then return data end
+        end
+        return nil
+    end
+    local function save(data)
+        local ok, saved = pcall(store.write, ACCOUNT_FILE, data)
+        return ok and saved and true or false
+    end
+    local function ensureRednet()
+        for _, name in ipairs(peripheral.getNames()) do
+            if peripheral.getType(name) == "modem" and rednet.isOpen(name) then return true end
+        end
+        for _, name in ipairs(peripheral.getNames()) do
+            if peripheral.getType(name) == "modem" then
+                rednet.open(name)
+                return true
+            end
+        end
+        return false
+    end
+    local function request(message)
+        if not ensureRednet() then return nil, "Attach a modem to use your Rift account." end
+        local protocol = "rift_account_v1"
+        local serverId = rednet.lookup(protocol, "rift-server")
+        if not serverId then
+            protocol = "rift_jobs_v1"
+            serverId = rednet.lookup(protocol, "rift-jobs")
+        end
+        if not serverId then return nil, "Rift account server not found." end
+        rednet.send(serverId, message, protocol)
+        local senderId, response = rednet.receive(protocol, 5, serverId)
+        if senderId ~= serverId or type(response) ~= "table" then
+            return nil, "No response from the Rift account server."
+        end
+        if response.type == "error" then return nil, response.message or "The request failed." end
+        return response
+    end
+    local function authenticate(action, username, password)
+        if type(username) ~= "string" or username == "" or type(password) ~= "string" or password == "" then
+            return false, "Enter a username and password."
+        end
+        local response, err = request({ type = action, username = username, password = password })
+        if not response then return false, err end
+        if response.type ~= "authenticated" or type(response.username) ~= "string" then
+            return false, "Unexpected response from the Rift account server."
+        end
+        local data = load()
+        if not data or data.username:lower() ~= response.username:lower() then data = {} end
+        data.username = response.username
+        data.password = password
+        save(data)
+        state.user = response.username
+        return true, response.username
+    end
+
+    api.saved = function()
+        local data = load()
+        return data and data.username or nil
+    end
+    api.current = function() return state.user end
+    api.login = function(username, password) return authenticate("login", username, password) end
+    api.register = function(username, password) return authenticate("register", username, password) end
+    api.lookup = function(identifier)
+        if not state.user then return nil, "Sign in to your Rift account first." end
+        local response, err = request({ type = "lookup", identifier = identifier })
+        if not response then return nil, err end
+        if response.type ~= "account_lookup" or type(response.username) ~= "string"
+            or type(response.uuid) ~= "string" then
+            return nil, "Unexpected response from the Rift account server."
+        end
+        return { username = response.username, uuid = response.uuid }
+    end
+    api.auto = function()
+        local data = load()
+        if not data or type(data.password) ~= "string" then return false, "No saved Rift account." end
+        return authenticate("login", data.username, data.password)
+    end
+    api.logout = function()
+        local response, err = request({ type = "logout" })
+        local data = load()
+        if data then
+            data.password = nil
+            save(data)
+        end
+        state.user = nil
+        if not response then return false, err end
+        return true
+    end
+    -- Launcher-drawn account page shared by every app. Returns the username, or nil if cancelled.
+    api.signIn = function(options)
+        options = type(options) == "table" and options or {}
+        options.app = options.app or riftModules.appName()
+        if state.user then return state.user end
+        local ok, result = api.auto()
+        if ok then return result end
+        local saved = api.saved()
+        local status = saved and result ~= "No saved Rift account." and tostring(result) or nil
+        local theme = getThemeInfo()
+        local accent = term.isColor() and theme.accent or colors.gray
+        local function page(title, hint)
+            local screen = term.current()
+            local width, height = screen.getSize()
+            screen.setBackgroundColor(colors.black)
+            screen.clear()
+            screen.setCursorPos(1, 1)
+            screen.setBackgroundColor(accent)
+            screen.setTextColor(colors.white)
+            screen.write(string.rep(" ", width))
+            screen.setCursorPos(2, 1)
+            screen.write("RIFT ACCOUNT" .. (options.app and ("  /  " .. tostring(options.app):upper()) or ""))
+            screen.setBackgroundColor(colors.black)
+            screen.setCursorPos(2, 3)
+            screen.setTextColor(colors.white)
+            screen.write(title)
+            if hint then
+                screen.setCursorPos(2, 4)
+                screen.setTextColor(colors.lightGray)
+                screen.write(hint:sub(1, width - 2))
+            end
+            if status then
+                screen.setCursorPos(2, height)
+                screen.setTextColor(colors.yellow)
+                screen.write(status:sub(1, width - 2))
+            end
+            screen.setTextColor(colors.white)
+        end
+        local function field(label, hidden, default)
+            page(label, "Enter to confirm, leave blank to go back")
+            local _, height = term.getSize()
+            local screen = term.current()
+            screen.setCursorPos(2, 6)
+            screen.setTextColor(accent)
+            screen.write("> ")
+            screen.setTextColor(colors.white)
+            local value = read(hidden and "*" or nil, nil, nil, default)
+            if value == nil or value == "" then return nil end
+            return value
+        end
+        local function choose()
+            local labels = { "Sign in", "Create account", "Cancel" }
+            local selected = 1
+            while true do
+                page("Sign in with your Rift account", options.reason)
+                local screen = term.current()
+                for index, label in ipairs(labels) do
+                    screen.setCursorPos(3, 5 + index)
+                    screen.setBackgroundColor(index == selected and accent or colors.black)
+                    screen.setTextColor(colors.white)
+                    screen.write(" " .. label .. " ")
+                end
+                screen.setBackgroundColor(colors.black)
+                local event, a, b, c = os.pullEvent()
+                if event == "key" then
+                    if a == keys.up and selected > 1 then selected = selected - 1
+                    elseif a == keys.down and selected < #labels then selected = selected + 1
+                    elseif a == keys.enter then return selected
+                    elseif a == keys.escape then return 3 end
+                elseif event == "mouse_click" then
+                    local index = c - 5
+                    if index >= 1 and index <= #labels and b >= 3 then return index end
+                end
+            end
+        end
+        while true do
+            local choice = choose()
+            if choice == 3 then
+                os.queueEvent("term_resize")
+                return nil
+            end
+            status = nil
+            local username = field(choice == 1 and "Username or UUID" or "Username", false, saved)
+            local password = username and field("Password", true)
+            local confirmed = password
+            if password and choice == 2 then
+                confirmed = field("Confirm password", true)
+                if confirmed ~= password then
+                    status = "The passwords do not match."
+                    password = nil
+                end
+            end
+            if username and password and confirmed then
+                local success, message = authenticate(choice == 2 and "register" or "login", username, password)
+                if success then
+                    os.queueEvent("term_resize")
+                    return message
+                end
+                status = tostring(message)
+            end
+        end
+    end
+    api.get = function(key, subkey, ...)
+        local default = ...
+        if marketFields[key] and select("#", ...) == 0 then
+            default, subkey, key = subkey, key, "market"
+        end
+        if not state.user then return nil, "Sign in to your Rift account first." end
+        local response, err = request({ type = "get_data", key = key, subkey = subkey })
+        if not response then return nil, err end
+        if response.type ~= "account_data" then return nil, "Unexpected response from the Rift account server." end
+        if response.found then return response.value end
+        if key == "market" and marketFields[subkey] then
+            local data = load()
+            if data and data.username:lower() == state.user:lower() and data[subkey] ~= nil then
+                local saved, saveError = request({ type = "set_data", key = key, subkey = subkey, value = data[subkey] })
+                if not saved then return nil, saveError end
+                if saved.type ~= "account_data_saved" then
+                    return nil, "Unexpected response from the Rift account server."
+                end
+                local value = data[subkey]
+                data[subkey] = nil
+                if not save(data) then return nil, "Could not update local Rift account data." end
+                return value
+            end
+        end
+        return default
+    end
+    api.set = function(key, subkey, ...)
+        local value = ...
+        if marketFields[key] and select("#", ...) == 0 then
+            value, subkey, key = subkey, key, "market"
+        end
+        if not state.user then return false, "Sign in to your Rift account first." end
+        local response, err = request({ type = "set_data", key = key, subkey = subkey, value = value })
+        if not response then return false, err end
+        if response.type ~= "account_data_saved" then return false, "Unexpected response from the Rift account server." end
+        if key == "market" and marketFields[subkey] then
+            local data = load()
+            if data and data.username:lower() == state.user:lower() and data[subkey] ~= nil then
+                data[subkey] = nil
+                if not save(data) then return false, "Could not update local Rift account data." end
+            end
+        end
+        return true
+    end
+    return api
+end
+
+riftModules.appName = function()
+    local path = bgServices.currentApp
+    if type(path) ~= "string" then return "An app" end
+    return (fs.getName(path):gsub("%.lua$", ""))
+end
+
+-- Peripherals are blocked until the user allows each type; modems always pass.
+riftModules.peripheral = function()
+    local real = peripheral
+    local filtered = {}
+    for name, value in pairs(real) do filtered[name] = value end
+    local function typeOf(name)
+        if type(name) ~= "string" then return nil end
+        return (real.getType(name))
+    end
+    local function allowed(kind)
+        if kind == "modem" then return true end
+        return riftModules.check("peripheral:" .. kind, "your " .. kind, riftModules.appName())
+    end
+    filtered.wrap = function(name)
+        local kind = typeOf(name)
+        if not kind or not allowed(kind) then return nil end
+        return real.wrap(name)
+    end
+    filtered.find = function(kind, filter)
+        if type(kind) ~= "string" or not allowed(kind) then return nil end
+        return real.find(kind, filter)
+    end
+    filtered.call = function(name, ...)
+        local kind = typeOf(name)
+        if kind and not allowed(kind) then
+            error("Access to the " .. kind .. " peripheral was denied.", 2)
+        end
+        return real.call(name, ...)
+    end
+    return filtered
+end
+
+-- Themed dialogs drawn on the app's current terminal.
+riftModules.ui = function()
+    local ui = {}
+    local function accent()
+        local theme = getThemeInfo()
+        return theme.accent or colors.blue
+    end
+    local function wrapText(text, width)
+        local lines = {}
+        for paragraph in (tostring(text) .. "\n"):gmatch("(.-)\n") do
+            local line = ""
+            for word in paragraph:gmatch("%S+") do
+                if #line + #word + 1 > width and #line > 0 then
+                    lines[#lines + 1] = line
+                    line = word
+                else
+                    line = (#line > 0 and line .. " " or "") .. word
+                end
+            end
+            lines[#lines + 1] = line
+        end
+        return lines
+    end
+    local function box(title, lines, footer, selected)
+        local screen = term.current()
+        local width, height = screen.getSize()
+        local boxWidth = math.min(width, 34)
+        local body = {}
+        for _, line in ipairs(lines) do
+            for _, part in ipairs(wrapText(line, boxWidth - 2)) do body[#body + 1] = part end
+        end
+        local boxHeight = math.min(height, #body + 4)
+        local left = math.floor((width - boxWidth) / 2) + 1
+        local top = math.max(1, math.floor((height - boxHeight) / 2) + 1)
+        for row = 0, boxHeight - 1 do
+            screen.setCursorPos(left, top + row)
+            screen.setBackgroundColor(row == 0 and accent() or colors.gray)
+            screen.setTextColor(colors.white)
+            screen.write(string.rep(" ", boxWidth))
+        end
+        screen.setCursorPos(left + 1, top)
+        screen.setBackgroundColor(accent())
+        screen.write(tostring(title or ""):sub(1, boxWidth - 2))
+        screen.setBackgroundColor(colors.gray)
+        for index, line in ipairs(body) do
+            if index + 1 <= boxHeight - 2 then
+                screen.setCursorPos(left + 1, top + index)
+                screen.setBackgroundColor(selected == index and accent() or colors.gray)
+                screen.write(line:sub(1, boxWidth - 2))
+            end
+        end
+        screen.setBackgroundColor(colors.gray)
+        screen.setTextColor(colors.lightGray)
+        screen.setCursorPos(left + 1, top + boxHeight - 1)
+        screen.write((footer or ""):sub(1, boxWidth - 2))
+        return { left = left, top = top, width = boxWidth, height = boxHeight, count = #body }
+    end
+    local function finish()
+        os.queueEvent("term_resize")
+    end
+
+    ui.notice = function(message, title)
+        box(title or "Notice", { tostring(message) }, "Press any key")
+        while true do
+            local event = os.pullEvent()
+            if event == "key" or event == "mouse_click" then break end
+        end
+        finish()
+    end
+
+    ui.confirm = function(message, title)
+        box(title or "Confirm", { tostring(message) }, "Y Yes   N No")
+        local answer
+        while answer == nil do
+            local event, code = os.pullEvent()
+            if event == "key" then
+                if code == keys.y or code == keys.enter then answer = true
+                elseif code == keys.n or code == keys.escape then answer = false end
+            end
+        end
+        finish()
+        return answer
+    end
+
+    ui.menu = function(title, items)
+        if type(items) ~= "table" or #items == 0 then return nil end
+        local selected = 1
+        while true do
+            local labels = {}
+            for index, item in ipairs(items) do labels[index] = tostring(item) end
+            local area = box(title or "Choose", labels, "Up/Down Enter Esc", selected)
+            local event, a, b, c = os.pullEvent()
+            if event == "key" then
+                if a == keys.up and selected > 1 then selected = selected - 1
+                elseif a == keys.down and selected < #items then selected = selected + 1
+                elseif a == keys.enter then finish() return selected
+                elseif a == keys.escape then finish() return nil end
+            elseif event == "mouse_click" then
+                local index = c - area.top
+                if b >= area.left and b < area.left + area.width and index >= 1 and items[index] then
+                    finish()
+                    return index
+                end
+            end
+        end
+    end
+
+    ui.input = function(prompt, options)
+        options = type(options) == "table" and options or {}
+        local area = box(options.title or "Input", { tostring(prompt), "" }, "Enter to confirm")
+        local screen = term.current()
+        screen.setCursorPos(area.left + 1, area.top + area.height - 2)
+        screen.setBackgroundColor(colors.black)
+        screen.setTextColor(colors.white)
+        local value = read(options.hidden and "*" or nil, nil, nil, options.default)
+        finish()
+        return value
+    end
+
+    ui.theme = function()
+        return getThemeInfo()
+    end
+    return ui
+end
+
+bgServices.endpoints = {}
+
+bgServices.api = {
+    -- persistInit("name", function() ... end): declare the persistent endpoint at the top of the app.
+    -- It only registers the function. It starts nothing in a normal run (spawn does that). After a
+    -- reboot the launcher runs the app hidden; when the run reaches this call the launcher starts the
+    -- registered function as the service and discards the hidden run, so the rest never executes.
+    persistInit = function(name, fn, options)
+        if type(name) ~= "string" or not name:match("^[%w_.-]+$") or #name > 32 then
+            error("Service names use letters, digits, _ . - and at most 32 characters.", 2)
+        end
+        if type(fn) ~= "function" then error("Service body must be a function.", 2) end
+        if not currentUser then return false, "Nobody is signed in." end
+        local displayName = type(options) == "table" and options.displayName and tostring(options.displayName):sub(1, 40)
+        local appPath = bgServices.currentApp
+        if not appPath then return false, "persistInit must be called from an app in the profile." end
+        bgServices.endpoints[name] = { fn = fn, displayName = displayName or name, path = appPath }
+        local host = bgServices.hosting
+        if host and host.hostFor == name then
+            if bgServices.permissions()[tostring(currentUser) .. ":" .. name] == true then
+                bgServices.spawn(name, fn, displayName)
+            end
+            host.stopping = true
+            host.finished = true
+            bgServices.remove(host)
+            -- The host is discarded here, so nothing after this call runs after a reboot.
+            while true do coroutine.yield("rift_service_host_done") end
+        end
+        return true
+    end,
+    -- spawn("name" [, function() ... end] [, options]): the app registers and starts the service.
+    -- With a persistInit endpoint for this name the service is also restored after every reboot.
+    spawn = function(name, fn, options)
+        if type(name) ~= "string" or not name:match("^[%w_.-]+$") or #name > 32 then
+            error("Service names use letters, digits, _ . - and at most 32 characters.", 2)
+        end
+        if type(fn) ~= "function" then
+            if options == nil then options = fn end
+            fn = nil
+        end
+        local endpoint = bgServices.endpoints[name]
+        fn = fn or (endpoint and endpoint.fn)
+        if not fn then error("Service body must be a function, or declare it with persistInit first.", 2) end
+        if not currentUser then return false, "Nobody is signed in." end
+        if bgServices.find(name) then return false, "Service is already running." end
+        local displayName = type(options) == "table" and options.displayName and tostring(options.displayName):sub(1, 40)
+            or (endpoint and endpoint.displayName)
+        local persist = endpoint ~= nil
+        if not bgServices.ask(name, displayName or name, persist) then return false, "Permission denied." end
+        local ok, reason = bgServices.spawn(name, fn, displayName)
+        if ok and persist then
+            bgServices.remember(bgServices.persistPrefix() .. name,
+                { path = endpoint.path, displayName = displayName or name })
+        end
+        return ok, reason
+    end,
+    -- forget("name"): stops a persistent service from coming back after reboot.
+    forget = function(name)
+        if type(name) ~= "string" then error("Service name must be a string.", 2) end
+        bgServices.remember(bgServices.persistPrefix() .. name, nil)
+        return true
+    end,
+    -- install("name", "/apps/sync.lua", { displayName, description, startType, recovery })
+    install = function(name, path, options)
+        options = type(options) == "table" and options or {}
+        if type(name) ~= "string" or not name:match("^[%w_.-]+$") or #name > 32 then
+            error("Service names use letters, digits, _ . - and at most 32 characters.", 2)
+        end
+        if type(path) ~= "string" then error("Service path must be a string.", 2) end
+        local segments = {}
+        for segment in path:gmatch("[^/]+") do
+            if segment == ".." then error("Service path cannot leave the profile.", 2) end
+            if segment ~= "." then segments[#segments + 1] = segment end
+        end
+        local cleanPath = table.concat(segments, "/")
+        if not homeDirectory then return false, "Nobody is signed in." end
+        local physical = fs.combine(homeDirectory, cleanPath)
+        if not fs.exists(physical) or fs.isDir(physical) then return false, "Program not found." end
+        local startType = options.startType or "manual"
+        if not START_TYPES[startType] then error("startType must be automatic, manual or disabled.", 2) end
+        local recovery = options.recovery == "restart" and "restart" or "none"
+        local config = bgServices.load()
+        config[name] = {
+            path = cleanPath,
+            displayName = tostring(options.displayName or name):sub(1, 40),
+            description = tostring(options.description or ""):sub(1, 200),
+            startType = startType,
+            recovery = recovery,
+        }
+        return bgServices.save(config)
+    end,
+    uninstall = function(name)
+        bgServices.stop(name)
+        local config = bgServices.load()
+        if not config[name] then return false, "No such service." end
+        config[name] = nil
+        bgServices.status[name] = nil
+        bgServices.crashes[name] = nil
+        return bgServices.save(config)
+    end,
+    start = function(name)
+        local entry = bgServices.load()[name]
+        if not entry then return false, "No such service." end
+        if entry.startType == "disabled" then return false, "Service is disabled." end
+        bgServices.crashes[name] = 0
+        return bgServices.launch(name, entry)
+    end,
+    stop = function(name) return bgServices.stop(name) end,
+    restart = function(name)
+        bgServices.stop(name)
+        return bgServices.api.start(name)
+    end,
+    setStartType = function(name, startType)
+        if not START_TYPES[startType] then error("startType must be automatic, manual or disabled.", 2) end
+        local config = bgServices.load()
+        if not config[name] then return false, "No such service." end
+        config[name].startType = startType
+        if startType == "disabled" then bgServices.stop(name) end
+        return bgServices.save(config)
+    end,
+    -- Returns "Running", "Stopped" or "Failed: reason".
+    status = function(name)
+        if bgServices.find(name) then return "Running" end
+        if not bgServices.load()[name] and not bgServices.status[name] then return nil end
+        return bgServices.status[name] or "Stopped"
+    end,
+    list = function()
+        local result = {}
+        for name, entry in pairs(bgServices.load()) do
+            result[#result + 1] = {
+                name = name,
+                displayName = entry.displayName or name,
+                description = entry.description or "",
+                path = entry.path,
+                startType = entry.startType or "manual",
+                recovery = entry.recovery or "none",
+                status = bgServices.find(name) and "Running" or (bgServices.status[name] or "Stopped"),
+            }
+        end
+        table.sort(result, function(a, b) return a.name < b.name end)
+        return result
+    end,
+}
+riftApi.service = bgServices.api
+
+local inputEvents = {
+    key = true, key_up = true, char = true, paste = true, terminate = true,
+    mouse_click = true, mouse_up = true, mouse_drag = true, mouse_scroll = true,
+}
+
+lockScreen = function()
+    local expected = currentUser and profilePasswords[currentUser]
+    if not expected or screenLocked then return false end
+    screenLocked = true
+    bootLog("LOCK screen engaged for " .. tostring(currentUser))
+    local screen = term.native()
+    local accent = screen.isColor() and colors.cyan or colors.white
+    local previousBlink = term.getCursorBlink()
+    local typed, status, deferred = "", "", {}
+
+    local function render()
+        local width, height = screen.getSize()
+        screen.setBackgroundColor(colors.black)
+        screen.clear()
+        local function center(row, text, color)
+            text = tostring(text):sub(1, width)
+            screen.setCursorPos(math.max(1, math.floor((width - #text) / 2) + 1), row)
+            screen.setTextColor(color)
+            screen.write(text)
+        end
+        local row = math.max(1, math.floor(height / 2) - 2)
+        center(row, "LOCKED", accent)
+        center(row + 1, currentUser, colors.lightGray)
+        local field = "Password: " .. string.rep("*", math.min(#typed, 24))
+        center(row + 3, field, colors.white)
+        center(row + 5, status, colors.red)
+        screen.setCursorPos(math.max(1, math.floor((width - #field) / 2) + 1) + #field, row + 3)
+        screen.setCursorBlink(true)
+    end
+
+    while screenLocked do
+        render()
+        local event = table.pack(unfilteredPullEventRaw())
+        local name = event[1]
+        bgServices.pump(event)
+        if name == "char" or name == "paste" then
+            typed = typed .. tostring(event[2])
+            status = ""
+        elseif name == "key" then
+            if event[2] == keys.backspace then
+                typed = typed:sub(1, -2)
+            elseif event[2] == keys.enter or event[2] == keys.numPadEnter then
+                if typed == expected then
+                    screenLocked = false
+                    bootLog("LOCK unlocked by " .. tostring(currentUser))
+                else
+                    bootLog("LOCK wrong password for " .. tostring(currentUser))
+                    status = "Incorrect password."
+                    typed = ""
+                end
+            end
+        elseif not inputEvents[name] and name ~= "terminate" and #deferred < 200 then
+            deferred[#deferred + 1] = event
+        end
+    end
+
+    screen.setCursorBlink(previousBlink)
+    lastActivity = nativeOs.clock()
+    for _, event in ipairs(deferred) do
+        nativeOs.queueEvent(table.unpack(event, 1, event.n))
+    end
+    nativeOs.queueEvent("term_resize")
+    return true
+end
+
+showSessionMenu = function(inProgram)
+    local level = "main"
+    local options
+    -- Services appear while Alt is held; see the event loop below.
+    local showServices = altState.left or altState.right
+    local function buildOptions()
+        options = {}
+        if level == "main" then
+            for _, task in ipairs(tasks) do
+                local label = task.name .. (task == foregroundTask and " (current)" or "")
+                options[#options + 1] = { label, "task", task = task }
+            end
+            options[#options + 1] = { "Session  >", "session_menu" }
+            if showServices then
+                options[#options + 1] = { "Services  >", "services_menu" }
+            end
+            options[#options + 1] = { "Exit Menu", "exit" }
+        elseif level == "services" then
+            local list = bgServices.api.list()
+            local running = {}
+            for _, service in ipairs(list) do running[service.name] = true end
+            for _, service in ipairs(bgServices.list) do
+                if not running[service.name] and not service.isHost then
+                    list[#list + 1] = { name = service.name, displayName = service.display, status = "Running" }
+                end
+            end
+            for _, service in ipairs(list) do
+                local mark = service.status == "Running" and "[on] " or "[off] "
+                options[#options + 1] = { mark .. service.displayName, "service", service = service }
+            end
+            if #list == 0 then options[#options + 1] = { "(no services)", "none" } end
+            options[#options + 1] = { "< Back", "back" }
+        else
+            options[#options + 1] = { "Lock", "lock" }
+            options[#options + 1] = { "Switch User", "switch_user" }
+            options[#options + 1] = { "Logout", "logout" }
+            options[#options + 1] = { "Reboot", "reboot" }
+            options[#options + 1] = { "Shutdown", "shutdown" }
+            options[#options + 1] = { "< Back", "back" }
+        end
+    end
+    buildOptions()
+
+    local width, height = term.getSize()
+    local boxWidth = math.min(width, 30)
+    local boxHeight = math.min(height, math.max(#tasks, #bgServices.list, 6) + 6)
+    local left = math.floor((width - boxWidth) / 2) + 1
+    local top = math.max(1, math.floor((height - boxHeight) / 2) + 1)
+    local previousBackground, previousText = term.getBackgroundColor(), term.getTextColor()
+    local previousX, previousY = term.getCursorPos()
+    local previousBlink = term.getCursorBlink()
+    term.setCursorBlink(false)
+
+    local highlighted = 1
+    local scrollTop = 0
+    local deferred = {}
+    local choice
+
+    local function render()
+        local visibleRows = boxHeight - 1
+        if highlighted <= scrollTop then scrollTop = highlighted - 1 end
+        if highlighted > scrollTop + visibleRows then scrollTop = highlighted - visibleRows end
+        scrollTop = math.max(0, math.min(scrollTop, math.max(0, #options - visibleRows)))
+        for row = 0, boxHeight - 1 do
+            term.setCursorPos(left, top + row)
+            term.setBackgroundColor(colors.gray)
+            term.setTextColor(colors.white)
+            term.write(string.rep(" ", boxWidth))
+        end
+        local title = level == "main" and "RIFT LAUNCHER" or (level == "services" and "SERVICES" or "SESSION")
+        term.setCursorPos(left + math.floor((boxWidth - #title) / 2), top)
+        term.write(title)
+        for row = 1, visibleRows do
+            local index = scrollTop + row
+            local option = options[index]
+            if not option then break end
+            term.setCursorPos(left, top + row)
+            if index == highlighted then
+                term.setBackgroundColor(colors.white)
+                term.setTextColor(colors.black)
+            else
+                term.setBackgroundColor(colors.gray)
+                term.setTextColor(colors.white)
+            end
+            local labelWidth = option.task and boxWidth - 3 or boxWidth
+            term.write((" " .. option[1] .. string.rep(" ", boxWidth)):sub(1, labelWidth))
+            if option.task then
+                term.setBackgroundColor(colors.red)
+                term.setTextColor(colors.white)
+                term.write(" X ")
+            end
+        end
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.lightGray)
+        if scrollTop > 0 then
+            term.setCursorPos(left + boxWidth - 1, top)
+            term.write("^")
+        end
+        if scrollTop + visibleRows < #options then
+            term.setCursorPos(left + boxWidth - 1, top + boxHeight - 1)
+            term.write("v")
+        end
+    end
+
+    -- Closes a task from the list. Closing the current app ends the menu so the driver can drop it.
+    local function closeTask(option)
+        bootLog("TASK close " .. tostring(option.task and option.task.name))
+        if option.task == foregroundTask then
+            choice = "close_app"
+            return
+        end
+        removeTask(option.task)
+        buildOptions()
+        highlighted = math.min(highlighted, #options)
+    end
+
+    local function chooseOption(option)
+        if option[2] == "task" then
+            if option.task == foregroundTask then
+                choice = "exit"
+            else
+                pendingSwitchTask = option.task.id
+                choice = "switch_task"
+            end
+        elseif option[2] == "session_menu" then
+            level = "session"
+            buildOptions()
+            highlighted = 1
+        elseif option[2] == "services_menu" then
+            level = "services"
+            buildOptions()
+            highlighted = 1
+        elseif option[2] == "service" then
+            -- Selecting a service toggles it: running services stop, stopped installed ones start.
+            local service = option.service
+            if service.status == "Running" then
+                bgServices.stop(service.name)
+            elseif service.path then
+                bgServices.api.start(service.name)
+            end
+            local keep = highlighted
+            buildOptions()
+            highlighted = math.min(keep, #options)
+        elseif option[2] == "none" then
+            return
+        elseif option[2] == "back" then
+            level = "main"
+            buildOptions()
+            highlighted = 1
+        else
+            choice = option[2]
+        end
+    end
+
+    while not choice do
+        render()
+        local event = table.pack(unfilteredPullEventRaw())
+        local name = event[1]
+        -- Holding Alt reveals Services; once inside the submenu it stays until you go back.
+        local altHeld = altState.left or altState.right
+        if altHeld ~= showServices then
+            showServices = altHeld
+            if level == "main" then
+                buildOptions()
+                highlighted = math.min(highlighted, #options)
+            end
+        end
+        if name == "key" then
+            if event[2] == keys.up then
+                highlighted = highlighted == 1 and #options or highlighted - 1
+            elseif event[2] == keys.down then
+                highlighted = highlighted == #options and 1 or highlighted + 1
+            elseif event[2] == keys.enter or event[2] == keys.numPadEnter then
+                chooseOption(options[highlighted])
+            elseif (event[2] == keys.delete or event[2] == keys.x) and options[highlighted].task then
+                closeTask(options[highlighted])
+            elseif event[2] == keys.escape then
+                if level == "main" then
+                    choice = "exit"
+                else
+                    level = "main"
+                    buildOptions()
+                    highlighted = 1
+                end
+            end
+        elseif name == "mouse_click" then
+            -- Events from the driver or pump are absolute; events inside the app chain were already shifted.
+            local rowOffset = (statusBarActive and not inAppChain) and 1 or 0
+            local option = options[event[4] - rowOffset - top + scrollTop]
+            if option and event[4] - rowOffset > top and event[3] >= left and event[3] < left + boxWidth then
+                if option.task and event[3] >= left + boxWidth - 3 then
+                    closeTask(option)
+                else
+                    chooseOption(option)
+                end
+            end
+        elseif name == "mouse_scroll" then
+            highlighted = math.max(1, math.min(#options, highlighted + event[2]))
+        elseif not inputEvents[name] then
+            deferred[#deferred + 1] = event
+        end
+    end
+
+    term.setBackgroundColor(previousBackground)
+    term.setTextColor(previousText)
+    term.setCursorPos(previousX, previousY)
+    term.setCursorBlink(previousBlink)
+    for _, event in ipairs(deferred) do
+        nativeOs.queueEvent(table.unpack(event, 1, event.n))
+    end
+
+    if choice == "lock" then
+        nativeOs.queueEvent("rift_lock")
+        choice = "exit"
+    end
+    bootLog("SESSION menu choice: " .. tostring(choice))
+    if choice == "shutdown" then
+        nativeOs.shutdown()
+    elseif choice == "reboot" then
+        nativeOs.reboot()
+    end
+    if choice == "exit" then nativeOs.queueEvent("term_resize") end
+    return choice
+end
+
+local function launchSelected()
     local app = apps[selected]
     if not app then
         message = "Select an available program first."
-        return
-    end
-    if openInTab and (not nativeMultishell or type(nativeMultishell.launch) ~= "function") then
-        message = "This computer does not support program tabs."
-        return
-    end
-    if openInTab and app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "") then
-        message = "System Settings must be opened directly."
         return
     end
     local profileContext = {
@@ -2163,7 +4090,6 @@ local function launchSelected(openInTab)
         admins = profileAdmins,
         authorized = authorizedProfiles,
     }
-    restoreCloudMirrorTerminal()
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
     term.clear()
@@ -2173,18 +4099,23 @@ local function launchSelected(openInTab)
     local ok, result
     local profileProgramError
     local programErrors = {}
-    programTerminationRequested = false
-    local originalPrintError = printError
-    if not openInTab then
-        printError = function(text)
-            programErrors[#programErrors + 1] = tostring(text)
-            originalPrintError(text)
+    local restorePrintError = capturePrintError(function(text)
+        programErrors[#programErrors + 1] = text
+    end)
+    local function protectedRun(fn, ...)
+        nextTaskName = app.name
+        bgServices.nextPath = app.path
+        bootLog("APP start " .. tostring(app.name) .. " (" .. tostring(app.path) .. ") user=" .. tostring(currentUser))
+        local results = table.pack(pcall(runClosable, fn, ...))
+        if not results[1] then
+            bootLog("APP crash " .. tostring(app.name) .. ": " .. tostring(results[2]))
+            error(results[2], 0)
         end
+        bootLog("APP end " .. tostring(app.name) .. " ok=" .. tostring(results[2]) .. " result=" .. tostring(results[3]))
+        return table.unpack(results, 2, results.n)
     end
     if isInHomeDirectory(app.path) then
-        launchHomeProgramInTab = openInTab == true
-        ok, result = pcall(runHomeProgram, app.path, profileContext, profileContext.homeDirectory)
-        launchHomeProgramInTab = false
+        ok, result = protectedRun(runHomeProgram, app.path, profileContext, profileContext.homeDirectory)
     elseif app.path:gsub("^/+", "") == SYSTEM_FILE_BROWSER_PATH:gsub("^/+", "") then
         local function runProfileProgram(path, ...)
             local normalizedPath = type(path) == "string" and path:gsub("^/+", ""):gsub("/+$", "")
@@ -2193,14 +4124,12 @@ local function launchSelected(openInTab)
                 and normalizedPath:sub(1, #normalizedHome + 1) ~= normalizedHome .. "/") then
                 error("Only programs in the active profile home can be run here.", 0)
             end
-            local originalPrintError = printError
             local runtimeError
-            printError = function(text)
-                runtimeError = tostring(text)
-                originalPrintError(text)
-            end
-            local ran, result = pcall(runHomeProgram, path, profileContext, ...)
-            printError = originalPrintError
+            local restoreRuntimePrint = capturePrintError(function(text)
+                runtimeError = text
+            end)
+            local ran, result = runClosable(runHomeProgram, path, profileContext, ...)
+            restoreRuntimePrint()
             if not ran then
                 profileProgramError = tostring(result)
                 error(result, 0)
@@ -2217,85 +4146,46 @@ local function launchSelected(openInTab)
         local function authorizeLaunchProfile(username)
             return authorizeProfileAccess(username, profileContext)
         end
-        local runner = openInTab and nativeMultishell.launch or nativeOs.run
-        ok, result = pcall(runner, createSystemEnvironment(), app.path, profileContext.homeDirectory,
+        ok, result = protectedRun(nativeOs.run, createSystemEnvironment(), app.path, profileContext.homeDirectory,
             runProfileProgram, listLaunchProfiles, authorizeLaunchProfile)
-    elseif app.path:gsub("^/+", "") == SYSTEM_CLOUD_PATH:gsub("^/+", "") then
-        local environment = createSystemEnvironment()
-        environment.profileHomeDirectory = homeDirectory
-        environment.cloudRunProgram = createProfileCloudRunner(profileContext)
-        local cloudShell = {}
-        for name, value in pairs(shell) do cloudShell[name] = value end
-        cloudShell.run = nil
-        cloudShell.execute = nil
-        environment.shell = cloudShell
-        local runner = openInTab and nativeMultishell.launch or nativeOs.run
-        ok, result = pcall(runner, environment, app.path)
     elseif app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "") then
         local environment = createSystemEnvironment()
         environment.profileHomeDirectory = homeDirectory
-        environment.cloudRunProgram = createProfileCloudRunner(profileContext)
-        environment.cloudStartService = function(code)
-            return startCloudService(code, profileContext)
-        end
-        local runner = openInTab and nativeMultishell.launch or nativeOs.run
-        ok, result = pcall(runner, environment, app.path, homeDirectory, currentUser, getThemeInfo())
+        ok, result = protectedRun(nativeOs.run, environment, app.path, homeDirectory, currentUser, getThemeInfo())
     else
-        local runner = openInTab and nativeMultishell.launch or nativeOs.run
-        ok, result = pcall(runner, createSystemEnvironment(), app.path, homeDirectory)
+        ok, result = protectedRun(nativeOs.run, createSystemEnvironment(), app.path, homeDirectory)
     end
-    local programTerminated = programTerminationRequested
-    programTerminationRequested = false
-    if not openInTab then printError = originalPrintError end
+    restorePrintError()
     shell.setDir(previousDirectory)
-    restoreCloudMirrorTerminal()
-    if app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "")
-        and cloudServiceStatus then
-        message = "Cloud Catcher: " .. cloudServiceStatus
-    end
-    if openInTab then
-        if not ok then
-            message = "Could not open " .. app.name .. " in a tab: " .. tostring(result)
-        elseif not result then
-            message = "Could not open " .. app.name .. " in a tab."
-        else
-            if type(nativeMultishell.setTitle) == "function" then
-                pcall(nativeMultishell.setTitle, result, app.name)
-            end
-            if type(nativeMultishell.setFocus) == "function" then
-                pcall(nativeMultishell.setFocus, result)
-            end
-            message = ""
-        end
-        refreshApps()
-        return
-    end
     term.clear()
     term.setCursorPos(1, 1)
-    if not programTerminated and not ok then
+    if not ok then
+        bootLog("APP error " .. tostring(app.name) .. ": " .. tostring(result))
         printError("Program error: " .. tostring(result))
-    elseif not programTerminated and profileProgramError and #programErrors == 0 then
+    elseif profileProgramError and #programErrors == 0 then
+        bootLog("APP profile error " .. tostring(app.name) .. ": " .. profileProgramError)
         printError("Profile program error: " .. profileProgramError)
-    elseif not programTerminated and result == false and #programErrors == 0 then
+    elseif result == false and #programErrors == 0 then
+        bootLog("APP " .. tostring(app.name) .. " reported failure")
         printError("The program reported that it did not complete successfully.")
     end
-    if not programTerminated then
-        for _, programError in ipairs(programErrors) do
-            printError("Program error: " .. programError)
-        end
+    for _, programError in ipairs(programErrors) do
+        bootLog("APP printed error " .. tostring(app.name) .. ": " .. tostring(programError))
+        printError("Program error: " .. programError)
     end
-    local programFailed = not programTerminated
-        and (not ok or result == false or profileProgramError ~= nil or #programErrors > 0)
+    local programFailed = not ok or result == false or profileProgramError ~= nil or #programErrors > 0
     if programFailed then waitForReturn(true) end
-    if autoLaunchSession and not programTerminated then
+    if autoLaunchSession then
         autoLaunchSession = false
         currentUser = nil
         homeDirectory = nil
         authorizedProfiles = {}
+        bgServices.stopAll()
         chooseUser(true)
         selected = 1
         firstVisible = 1
         refreshApps()
+        bgServices.startAutomatic()
         if not ok then
             message = "Signed out after " .. app.name .. " exited with an error: " .. tostring(result)
         elseif result == false then
@@ -2305,17 +4195,8 @@ local function launchSelected(openInTab)
         end
         return
     end
-    if not programFailed and not programTerminated then waitForReturn(false) end
-            if event[1] == "terminate" and allowTerminate then
-                programTerminationRequested = true
-                error("Terminated", 0)
-            end
-    if app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "")
-        and cloudServiceStatus then
-        message = "Cloud Catcher: " .. cloudServiceStatus
-    else
-        message = ""
-    end
+    if not programFailed then waitForReturn(false) end
+    message = ""
     if app.path:gsub("^/+", "") == SETTINGS_PROGRAM_PATH:gsub("^/+", "") then
         loadSettings()
     end
@@ -2330,29 +4211,19 @@ local function openSystemSettings()
 
     local previousDirectory = shell.dir()
     shell.setDir(homeDirectory)
-    restoreCloudMirrorTerminal()
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
     term.clear()
     term.setCursorPos(1, 1)
-    local profileContext = {
-        user = currentUser,
-        homeDirectory = homeDirectory,
-        passwords = profilePasswords,
-        admins = profileAdmins,
-        authorized = authorizedProfiles,
-    }
     local environment = createSystemEnvironment()
     environment.profileHomeDirectory = homeDirectory
-    environment.cloudRunProgram = createProfileCloudRunner(profileContext)
-    environment.cloudStartService = function(code)
-        return startCloudService(code, profileContext)
-    end
-    local ok, result = pcall(nativeOs.run, environment, SETTINGS_PROGRAM_PATH,
+    nextTaskName = "Settings"
+    local ok, result = runClosable(nativeOs.run, environment, SETTINGS_PROGRAM_PATH,
         homeDirectory, currentUser, getThemeInfo())
     shell.setDir(previousDirectory)
-    restoreCloudMirrorTerminal()
     loadSettings()
+    local reloadedPasswords = loadProfilePasswords()
+    if reloadedPasswords then profilePasswords = reloadedPasswords end
     refreshApps()
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
@@ -2360,15 +4231,59 @@ local function openSystemSettings()
     term.setCursorPos(1, 1)
     if not ok then
         message = "System Settings error: " .. tostring(result)
-    elseif cloudServiceStatus then
-        message = "Cloud Catcher: " .. cloudServiceStatus
     elseif result == false then
         message = "System Settings did not complete successfully."
     end
 end
 
+local function killAllTasks()
+    bgServices.stopAll()
+    for index = #tasks, 1, -1 do table.remove(tasks, index) end
+end
+
+local function applySessionAction(action)
+    bootLog("SESSION action " .. tostring(action) .. " user=" .. tostring(currentUser))
+    if action == "switch_task" then
+        local task = pendingSwitchTask and findTask(pendingSwitchTask)
+        pendingSwitchTask = nil
+        if task and not task.finished then
+            local ok, result = runForeground(task, term.current())
+            if ok == false then message = "Program error: " .. tostring(result) end
+        end
+    elseif action == "switch_user" then
+        if chooseUser() then
+            killAllTasks()
+            selected = 1
+            firstVisible = 1
+            refreshApps()
+            bgServices.startAutomatic()
+            message = ""
+        end
+    elseif action == "logout" then
+        killAllTasks()
+        currentUser = nil
+        homeDirectory = nil
+        authorizedProfiles = {}
+        chooseUser(true)
+        selected = 1
+        firstVisible = 1
+        refreshApps()
+        bgServices.startAutomatic()
+        message = ""
+    end
+end
+
 local function launcherMain()
-startBootPhase()
+bootLog("---- BOOT launcher " .. tostring(fs.exists(LAUNCHER_PATH) and fs.getSize(LAUNCHER_PATH))
+    .. " bytes; free=" .. tostring(fs.getFreeSpace("/")) .. "; http=" .. tostring(http ~= nil)
+    .. "; pending=" .. tostring(fs.exists(PENDING_BOOT_PATH)) .. "; good=" .. tostring(fs.exists(GOOD_LAUNCHER_PATH))
+    .. "; bad=" .. tostring(fs.exists(BAD_LAUNCHER_PATH)))
+local recoveryRequested = bootRecoveryRequested()
+if recoveryRequested then bootLog("Recovery menu opened (R held)") end
+if recoverFromFailedUpdate() then skipLauncherUpdate = true end
+if recoveryRequested then
+    skipLauncherUpdate = recoveryMenu() == "continue"
+end
 startBootPhase()
 local migrateLegacySettings = not fs.exists(SETTINGS_PATH) and fs.exists(LEGACY_SETTINGS_PATH)
 local keyReady, keyError = ensureEncryptionKey()
@@ -2385,22 +4300,32 @@ if migrateLegacySettings or settingsNeedEncryption then
 end
 
 local downloaderReady, downloaderError = installDownloader()
+bootLog("Downloader ready=" .. tostring(downloaderReady) .. (downloaderError and (" error=" .. tostring(downloaderError)) or ""))
+if fs.exists(LEGACY_CLOUD_PATH) then pcall(fs.delete, LEGACY_CLOUD_PATH) end
 startBootPhase()
 autoUpdateLauncher()
 
 startBootPhase()
 chooseUser()
+bootLog("Signed in: " .. tostring(currentUser))
 local systemAppInstallMessage
 if downloaderReady then
-    local ok, result = pcall(nativeOs.run, _ENV, DOWNLOADER_PATH, "install-system", homeDirectory)
-    if not ok or result == false then
-        systemAppInstallMessage = ok
-            and "Could not automatically install system apps: the downloader did not complete successfully."
-            or "Could not run system app installation: " .. tostring(result)
+    local installer, loadError = loadfile(DOWNLOADER_PATH, "t", _ENV)
+    if not installer then
+        systemAppInstallMessage = "System app installer is broken: " .. tostring(loadError)
+    else
+        local ok, result = pcall(installer, "install-system", homeDirectory)
+        if not ok then
+            systemAppInstallMessage = "System app install failed: " .. tostring(result)
+        end
     end
 else
     systemAppInstallMessage = "Could not prepare the system app installer: " .. tostring(downloaderError)
 end
+if fs.exists(PENDING_BOOT_PATH) then fs.delete(PENDING_BOOT_PATH) end
+bootLog("Boot complete; update marker cleared")
+bgServices.startAutomatic()
+if systemAppInstallMessage then bootLog(systemAppInstallMessage) end
 
 refreshApps()
 if startupError and systemAppInstallMessage then
@@ -2429,11 +4354,21 @@ if settings.autoLaunchPath then
     end
 end
 
+sessionMenuAllowed = true
+lastActivity = nativeOs.clock()
 while true do
-    restoreCloudMirrorTerminal()
+    if pendingSessionAction then
+        local action = pendingSessionAction
+        pendingSessionAction = nil
+        applySessionAction(action)
+    end
     local firstButtons, secondButtons = draw()
-    local event, button, x, y = os.pullEventRaw()
-    if event == "key" and (button == keys.n or button == keys.v) then
+    local pulled = table.pack(os.pullEventRaw())
+    pumpBackground(pulled)
+    local event, button, x, y = table.unpack(pulled, 1, pulled.n)
+    if event == "session_action" then
+        applySessionAction(button)
+    elseif event == "key" and (button == keys.n or button == keys.v) then
         local _, height = term.getSize()
         local visibleRows = math.max(1, height - 12)
         selected = math.max(1, math.min(#apps,
@@ -2460,23 +4395,19 @@ while true do
                 updateSelected()
             elseif action == "settings" then
                 openSystemSettings()
-            elseif action == "tab" then
-                launchSelected(true)
             end
         elseif y == height - 1 then
             local action = buttonAt(secondButtons, x)
-            if action == "user" then
-                if chooseUser() then
-                    selected = 1
-                    firstVisible = 1
-                    refreshApps()
-                    message = ""
-                else
-                    message = ""
-                end
-            elseif action == "refresh" then
+            if action == "refresh" then
                 refreshApps()
                 message = ""
+            elseif action == "alerts" then
+                showNotifications()
+            elseif action == "tasks" then
+                local choice = showSessionMenu(false)
+                if choice == "switch_task" or choice == "switch_user" or choice == "logout" then
+                    applySessionAction(choice)
+                end
             end
         end
     end
@@ -2484,4 +4415,11 @@ end
 
 end
 
-launcherMain()
+local crashed, crashError = xpcall(launcherMain, function(err)
+    local trace = type(debug) == "table" and type(debug.traceback) == "function"
+        and debug.traceback(tostring(err), 2) or tostring(err)
+    bootLog("CRASH " .. tostring(err))
+    for line in tostring(trace):gmatch("[^\n]+") do bootLog("  " .. line) end
+    return err
+end)
+if not crashed then error(crashError, 0) end

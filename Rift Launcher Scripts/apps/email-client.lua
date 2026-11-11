@@ -1,18 +1,6 @@
 local PROTOCOL = "rift_mail_v1"
 local SERVER_NAME = "rift-mail"
-local ACCOUNT_PROTOCOL = "rift_account_v1"
-local ACCOUNT_SERVER_NAME = "rift-server"
-local LEGACY_ACCOUNT_PROTOCOL = "rift_jobs_v1"
-local LEGACY_ACCOUNT_SERVER_NAME = "rift-jobs"
 local TIMEOUT = 5
-local RIFT_ACCOUNT_PATH = "rift/account.json"
-local LEGACY_ACCOUNT_PATH = "rift-jobs/login.json"
-local storageLoaded, storage = pcall(require, "storage")
-if not storageLoaded or type(storage) ~= "table"
-    or type(storage.read) ~= "function" or type(storage.write) ~= "function"
-    or type(storage.delete) ~= "function" then
-    storage = nil
-end
 local mouseEnabled = false
 local account
 local currentFolder = "Inbox"
@@ -222,157 +210,12 @@ local function readField(label, secret)
     return read(secret and "*" or nil)
 end
 
-local function readSavedAccount(path)
-    local storageError
-    if storage then
-        local ok, data, err = pcall(storage.read, path)
-        if ok and data ~= nil then
-            if type(data) ~= "table" or type(data.username) ~= "string"
-                or (data.password ~= nil and type(data.password) ~= "string") then
-                return nil, "Saved Rift account data is invalid."
-            end
-            return data
-        end
-        if not ok then
-            storageError = data
-        elseif err ~= "Stored data was not found." then
-            storageError = err
-        end
-    end
-
-    local absolutePath = "/" .. path
-    if not fs.exists(absolutePath) then
-        if storageError and storageError ~= "Stored data was not found." then
-            return nil, "Launcher storage: " .. tostring(storageError)
-                .. "; no root account file exists at " .. absolutePath .. "."
-        end
-        return nil
-    end
-    if fs.isDir(absolutePath) then return nil, "Saved Rift account path is a folder." end
-    local file = fs.open(absolutePath, "r")
-    if not file then return nil, "Could not open the saved Rift account." end
-    local contents = file.readAll()
-    file.close()
-    local ok, data = pcall(textutils.unserializeJSON, contents)
-    if not ok or type(data) ~= "table" or type(data.username) ~= "string"
-        or (data.password ~= nil and type(data.password) ~= "string") then
-        return nil, "Saved Rift account data is invalid."
-    end
-    return data
-end
-
-local function saveAccount(data)
-    local storageError
-    if storage then
-        local ok, saved, err = pcall(storage.write, RIFT_ACCOUNT_PATH, data)
-        if ok and saved then return true end
-        storageError = ok and err or saved
-    end
-
-    local encoded, contents = pcall(textutils.serializeJSON, data)
-    if not encoded or type(contents) ~= "string" then
-        return false, "Rift account data could not be serialized."
-    end
-    local directory = "/rift"
-    if not fs.exists(directory) then fs.makeDir(directory) end
-    if not fs.isDir(directory) then return false, "The /rift account path is not a directory." end
-    local file = fs.open("/" .. RIFT_ACCOUNT_PATH, "w")
-    if not file then
-        return false, "Could not save the Rift account to /rift/account.json."
-            .. (storageError and " Launcher storage also failed: " .. tostring(storageError) or "")
-    end
-    local wrote, writeError = pcall(file.write, contents)
-    local closed, closeError = pcall(file.close)
-    if not wrote or not closed then
-        return false, "Could not write the saved Rift account: "
-            .. tostring(not wrote and writeError or closeError)
-    end
-    return true
-end
-
-local function loadAccount()
-    local data, err = readSavedAccount(RIFT_ACCOUNT_PATH)
-    if data then return type(data.password) == "string" and data or nil end
-    if err then return nil, err end
-    data, err = readSavedAccount(LEGACY_ACCOUNT_PATH)
-    if data and type(data.password) == "string" then
-        local saved, saveError = saveAccount(data)
-        if not saved then notice("ACCOUNT STORAGE", saveError) end
-    end
-    return data and type(data.password) == "string" and data or nil, err
-end
-
-local function authenticateAccount(username, password)
-    local accountProtocol = ACCOUNT_PROTOCOL
-    local serverId = rednet.lookup(accountProtocol, ACCOUNT_SERVER_NAME)
-    if not serverId then
-        accountProtocol = LEGACY_ACCOUNT_PROTOCOL
-        serverId = rednet.lookup(accountProtocol, LEGACY_ACCOUNT_SERVER_NAME)
-    end
-    if not serverId then
-        return false, "Rift account server not found. Check that Rift Server is running."
-    end
-    rednet.send(serverId, {
-        type = "login",
-        username = username,
-        password = password,
-    }, accountProtocol)
-    local senderId, response = rednet.receive(accountProtocol, TIMEOUT, serverId)
-    if senderId ~= serverId or type(response) ~= "table" then
-        return false, "No response from the Rift account server."
-    end
-    if response.type == "error" then
-        return false, response.message or "Rift account sign-in failed."
-    end
-    if response.type ~= "authenticated" or type(response.username) ~= "string" then
-        return false, "Unexpected response from the Rift account server."
-    end
-    local savedAccount = account
-    if type(savedAccount) ~= "table"
-        or type(savedAccount.username) ~= "string"
-        or savedAccount.username:lower() ~= response.username:lower() then
-        local storedAccount = readSavedAccount(RIFT_ACCOUNT_PATH)
-        savedAccount = type(storedAccount) == "table"
-            and type(storedAccount.username) == "string"
-            and storedAccount.username:lower() == response.username:lower()
-            and storedAccount or {}
-    end
-    savedAccount.username = response.username
-    savedAccount.password = password
-    account = savedAccount
-    local saved, saveError = saveAccount(account)
-    if not saved then
-        return true, "Signed in, but account details could not be saved: " .. tostring(saveError)
-    end
-    return true
-end
-
 local function signOut()
-    local accountProtocol = ACCOUNT_PROTOCOL
-    local serverId = rednet.lookup(accountProtocol, ACCOUNT_SERVER_NAME)
-    if not serverId then
-        accountProtocol = LEGACY_ACCOUNT_PROTOCOL
-        serverId = rednet.lookup(accountProtocol, LEGACY_ACCOUNT_SERVER_NAME)
-    end
-    if not serverId then
-        notice("SIGN OUT", "Rift account server not found; could not sign out.")
-        return false
-    end
-    rednet.send(serverId, { type = "logout" }, accountProtocol)
-    local senderId, response = rednet.receive(accountProtocol, TIMEOUT, serverId)
-    if senderId ~= serverId or type(response) ~= "table" or response.type ~= "logged_out" then
-        notice("SIGN OUT", "No confirmation from the Rift account server.")
-        return false
-    end
-    account.password = nil
-    local saved, saveError = saveAccount(account)
+    local ok, err = rift.account.logout()
     account = nil
     currentFolder = "Inbox"
-    if not saved then
-        notice("SIGN OUT", "Signed out, but saved credentials could not be cleared: "
-            .. tostring(saveError))
-    end
-    return true
+    if not ok then notice("SIGN OUT", tostring(err)) end
+    return ok
 end
 
 local function formatTime(timestamp)
@@ -715,22 +558,70 @@ local function compose()
     end
 end
 
-local function signIn()
-    local username = readField("Rift username:")
-    local password = readField("Password:", true)
-    local signedIn, message = authenticateAccount(username, password)
-    if not signedIn then notice("SIGN IN", message) end
-    if signedIn and message then notice("ACCOUNT STORAGE", message) end
+openModems()
+if type(rift) ~= "table" or type(rift.account) ~= "table" then
+    error("This version of Rift Launcher does not support Rift accounts. Update the launcher.")
+end
+do
+    local savedName = rift.account.saved()
+    if savedName then
+        local ok, result = rift.account.auto()
+        if ok then account = { username = result } end
+    end
 end
 
-openModems()
-local loadError
-account, loadError = loadAccount()
-if loadError then notice("ACCOUNT STORAGE", loadError) end
+-- Polls for new mail from a background service and raises a launcher notification.
+local POLL_SECONDS = 60
+local polling
+local seenMail, firstPoll = {}, true
+local serviceRequested = false
+
+local function checkMail()
+    if polling or not account or type(rift) ~= "table" or type(rift.notify) ~= "function" then return end
+    polling = true
+    pcall(function()
+        local response = request({ type = "list", category = "Inbox" })
+        if not response or type(response.messages) ~= "table" then return end
+        local unread, newest = 0, nil
+        for _, item in ipairs(response.messages) do
+            if not item.read then
+                unread = unread + 1
+                if not seenMail[item.id] then
+                    seenMail[item.id] = true
+                    if not firstPoll then newest = item end
+                end
+            end
+        end
+        if firstPoll and unread > 0 then
+            rift.notify("Rift Mail: " .. unread .. " unread message" .. (unread == 1 and "" or "s"))
+        elseif newest then
+            rift.notify("New mail from " .. tostring(newest.from) .. ": " .. tostring(newest.subject))
+        end
+        firstPoll = false
+    end)
+    polling = false
+end
+
+-- Persistent endpoint: after a reboot the launcher stops here and keeps only this service.
+if type(rift) == "table" and type(rift.service) == "table" and rift.service.persistInit then
+    rift.service.persistInit("rift-mail-notify", function()
+        sleep(5)
+        pcall(rift.account.auto)
+        while true do
+            checkMail()
+            sleep(POLL_SECONDS)
+        end
+    end, { displayName = "Rift Mail Notifications" })
+end
 
 while true do
     if account then
-        local signedIn, signInError = authenticateAccount(account.username, account.password)
+        local signedIn, signInResult = rift.account.auto()
+        local signInError = signInResult
+        if signedIn and not serviceRequested and type(rift) == "table" and rift.service then
+            serviceRequested = true
+            rift.service.spawn("rift-mail-notify")
+        end
         if not signedIn then
             account = nil
             notice("RIFT SIGN IN", signInError)
@@ -767,14 +658,8 @@ while true do
             return
         end
     else
-        local action = choose("RIFT MAIL", "Sign in with your Rift account", {
-            { key = "login", label = "Sign in" },
-            { key = "quit", label = "Quit" },
-        })
-        if action == "login" then
-            signIn()
-        elseif action == "quit" then
-            return
-        end
+        local name = rift.account.signIn()
+        if not name then return end
+        account = { username = name }
     end
 end

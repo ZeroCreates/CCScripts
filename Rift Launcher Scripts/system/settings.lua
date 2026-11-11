@@ -5,7 +5,6 @@ local PROFILE_PASSWORDS_PATH = SYSTEM_DIRECTORY .. "/profile-passwords.json"
 local PROFILE_ADMINS_PATH = SYSTEM_DIRECTORY .. "/profile-admins.json"
 local ENCRYPTION_KEY_PATH = SYSTEM_DIRECTORY .. "/.data-key"
 local LAUNCHER_PATH = "/launcher.lua"
-local CLOUD_PROGRAM_PATH = SYSTEM_DIRECTORY .. "/apps/cloud.lua"
 local HOST_BASE_URL = "https://rift.zerocreates.org/"
 
 local function displaySystemPath(path)
@@ -217,6 +216,7 @@ local settings = {
     customHighlight = validHexColor(savedSettings.customHighlight)
         and ("#" .. savedSettings.customHighlight:gsub("^#", ""):upper()) or "#3366CC",
     alphabetical = true,
+    rift = type(savedSettings.rift) == "table" and savedSettings.rift or {},
     autoLoginUser = type(savedSettings.autoLoginUser) == "string"
         and savedSettings.autoLoginUser:match("^[%w_-]+$") and savedSettings.autoLoginUser or nil,
     autoLaunchPath = type(savedSettings.autoLaunchPath) == "string"
@@ -503,6 +503,65 @@ local function savePreferences()
     return true
 end
 
+local IDLE_CHOICES = { 0, 1, 5, 10, 30 }
+
+local function cycleIdleLock(direction)
+    local current = 1
+    for index, minutes in ipairs(IDLE_CHOICES) do
+        if minutes == (tonumber(settings.rift.idleLockMinutes) or 0) then current = index end
+    end
+    current = (current - 1 + direction) % #IDLE_CHOICES + 1
+    settings.rift.idleLockMinutes = IDLE_CHOICES[current]
+    if IDLE_CHOICES[current] > 0 and not profilePasswords[currentUser] then
+        message = "Idle lock needs a password on this account."
+    end
+end
+
+local function cycleTimeZone(direction)
+    local offset = tonumber(settings.rift.timeZone)
+    -- Index 0 is "Local"; 1..27 map to UTC-12..UTC+14.
+    local index = offset and (offset + 13) or 0
+    index = (index + direction) % 28
+    settings.rift.timeZone = index > 0 and (index - 13) or nil
+end
+
+local function timeZoneLabel()
+    local offset = tonumber(settings.rift.timeZone)
+    if not offset then return "Local" end
+    return "UTC" .. (offset >= 0 and "+" or "") .. offset
+end
+
+local function changeOwnPassword()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("CHANGE PASSWORD FOR " .. currentUser)
+    local existing = profilePasswords[currentUser]
+    if existing then
+        write("Current password: ")
+        if read("*") ~= existing then
+            message = "Incorrect current password."
+            return
+        end
+    end
+    write("New password: ")
+    local password = read("*")
+    if type(password) ~= "string" or password == "" then
+        message = "Password cannot be empty."
+        return
+    end
+    write("Confirm new password: ")
+    if read("*") ~= password then
+        message = "Passwords did not match."
+        return
+    end
+    local passwords = copyMap(profilePasswords)
+    passwords[currentUser] = password
+    local saved, saveError = saveAccountData(passwords, profileAdmins)
+    message = saved and "Password changed." or tostring(saveError)
+end
+
 local function editCustomColor(field, label)
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
@@ -589,45 +648,6 @@ local function updateLauncher()
     end
     if fs.exists(backup) then fs.delete(backup) end
     message = "Launcher updated. Restart to use the new version."
-end
-
-local function startCloud()
-    if not fs.exists(CLOUD_PROGRAM_PATH) then
-        message = "Cloud Catcher is not installed. Refresh system apps and try again."
-        return
-    end
-    if not http or type(http.websocket) ~= "function" then
-        message = "Enable the ComputerCraft HTTP API and allow the Cloud Catcher host."
-        return
-    end
-
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.clear()
-    term.setCursorPos(1, 1)
-    print("RIFT LAUNCHER // CLOUD CATCHER")
-    print("Enter the 32-character connection code from https://cloud-catcher.squiddev.cc/.")
-    write("Code: ")
-    local code = read("*")
-    if not code or code == "" then
-        message = "Cloud Catcher was not started."
-        return
-    end
-    if #code ~= 32 or code:find("[^%a%d]") then
-        message = "Cloud Catcher code must be 32 letters or numbers."
-        return false
-    end
-    if type(cloudStartService) ~= "function" then
-        message = "The launcher cannot start Cloud Catcher in screen-mirror mode."
-        return false
-    end
-    local started, startError = cloudStartService(code)
-    if not started then
-        message = "Cloud Catcher error: " .. tostring(startError)
-        return false
-    end
-    message = "Cloud Catcher is running. Returning to the launcher."
-    return true
 end
 
 local function drawButtons(buttons, width, row, isColor)
@@ -738,7 +758,9 @@ local function draw()
     term.clear()
     term.setCursorPos(1, 1)
     term.setBackgroundColor(accent)
-    term.write((" RIFT LAUNCHER // SYSTEM SETTINGS"):sub(1, width))
+    term.setTextColor(term.isColor() and colors.black or colors.white)
+    term.write((" RIFT LAUNCHER // SYSTEM SETTINGS" .. string.rep(" ", width)):sub(1, width))
+    term.setTextColor(colors.white)
     term.setBackgroundColor(colors.black)
     term.setCursorPos(2, 2)
     term.setTextColor(colors.lightGray)
@@ -764,6 +786,11 @@ local function draw()
             "Sort programs alphabetically: " .. (settings.alphabetical and "On" or "Off"),
             "Auto-login this profile: " .. (settings.autoLoginUser == currentUser and "On" or "Off"),
             "Auto-launch program: " .. autoLaunchLabel,
+            "Boot logo: " .. (settings.rift.bootLogo == false and "Off" or "On"),
+            "Idle lock: " .. ((tonumber(settings.rift.idleLockMinutes) or 0) > 0
+                and (settings.rift.idleLockMinutes .. " min") or "Off"),
+            "Time zone: " .. timeZoneLabel(),
+            "Change my password",
         }
         for index, option in ipairs(options) do
             term.setCursorPos(2, index + 4)
@@ -780,7 +807,6 @@ local function draw()
         term.write(message:sub(1, math.max(0, width - 2)))
         buttons = {
             { label = isAdmin and "ACCOUNTS" or "NO ADMIN ACCESS", action = "accounts" },
-            { label = "CLOUD", action = "cloud" },
             { label = "MAINTENANCE", action = "maintenance" },
             { label = "EXIT", action = "exit" },
         }
@@ -802,7 +828,12 @@ local function draw()
         end
         term.setCursorPos(2, height - 2)
         term.setTextColor(colors.lightGray)
-        term.write(message:sub(1, math.max(0, width - 2)))
+        local wrapWidth = math.max(1, width - 2)
+        local text = tostring(message)
+        term.setCursorPos(2, height - 3)
+        term.write(text:sub(1, wrapWidth))
+        term.setCursorPos(2, height - 2)
+        term.write(text:sub(wrapWidth + 1, wrapWidth * 2))
         buttons = {
             { label = "BACK", action = "preferences" },
             { label = "EXIT", action = "exit" },
@@ -925,6 +956,24 @@ while true do
                     and "Selected " .. displayProgramName(settings.autoLaunchPath) .. " for automatic launch."
                     or "Automatic program launch disabled."
             end
+        elseif page == "settings" and y == 11 then
+            selectedUser = 7
+            settings.rift.bootLogo = settings.rift.bootLogo == false
+            savePreferences()
+        elseif page == "settings" and y == 12 then
+            selectedUser = 8
+            cycleIdleLock(x <= math.floor(select(1, term.getSize()) / 2) and -1 or 1)
+            local keptMessage = message
+            if savePreferences() and keptMessage:find("Idle lock needs", 1, true) then
+                message = keptMessage
+            end
+        elseif page == "settings" and y == 13 then
+            selectedUser = 9
+            cycleTimeZone(x <= math.floor(select(1, term.getSize()) / 2) and -1 or 1)
+            savePreferences()
+        elseif page == "settings" and y == 14 then
+            selectedUser = 10
+            changeOwnPassword()
         elseif page == "maintenance" and y == 5 then
             selectedUser = 1
             updateLauncher()
@@ -942,8 +991,6 @@ while true do
                 else
                     message = "Only an administrator can manage user accounts."
                 end
-            elseif action == "cloud" then
-                if startCloud() then return end
             elseif action == "preferences" then
                 page = "settings"
                 message = "Theme row: click left/right; choose Custom to use the hex colors."

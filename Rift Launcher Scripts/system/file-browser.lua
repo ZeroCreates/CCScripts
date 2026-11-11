@@ -30,12 +30,16 @@ local themes = {
     { accent = colors.lime, highlight = colors.green },
     { accent = colors.orange, highlight = colors.red },
     { accent = colors.purple, highlight = colors.magenta },
+    { accent = colors.cyan, highlight = colors.blue },
 }
 
 local function loadTheme()
     if type(launcherTheme) == "table" and type(launcherTheme.index) == "number"
         and themes[launcherTheme.index] then
         themeIndex = launcherTheme.index
+        if type(launcherTheme.accent) == "number" and type(launcherTheme.highlight) == "number" then
+            themes[themeIndex] = { accent = launcherTheme.accent, highlight = launcherTheme.highlight }
+        end
         return
     end
     local path = "/.launcher/settings.json"
@@ -151,7 +155,6 @@ end
 
 local function displayPath(path)
     local normalizedPath = path:gsub("^/+", "")
-    normalizedPath = normalizedPath:gsub("^%.launcher/users/", "users/")
     if normalizedPath == systemProgramsDirectory then return "S://" end
     if isWithinRoot(normalizedPath, systemProgramsDirectory) then
         return "S://" .. normalizedPath:sub(#systemProgramsDirectory + 2)
@@ -177,7 +180,6 @@ local function displayPath(path)
 end
 
 local function displayMessage(text)
-    text = text:gsub("%.launcher/users/", "users/")
     local systemProgramsPattern = systemProgramsDirectory:gsub("([^%w])", "%%%1")
     text = text:gsub("/" .. systemProgramsPattern .. "/", "S://")
         :gsub("/" .. systemProgramsPattern, "S://")
@@ -195,9 +197,7 @@ local function displayMessage(text)
         end
     end
     local homePattern = homeDirectory:gsub("([^%w])", "%%%1")
-    text = text:gsub(homePattern .. "/", "H://"):gsub(homePattern, "H://")
-    return (text:gsub("users/([%w_-]+)/", "H@%1://")
-        :gsub("users/([%w_-]+)%f[%W]", "H@%1://"))
+    return (text:gsub(homePattern .. "/", "H://"):gsub(homePattern, "H://"))
 end
 
 local function refreshDiskMounts()
@@ -404,7 +404,9 @@ local function draw()
     term.clear()
     term.setCursorPos(1, 1)
     term.setBackgroundColor(accent)
-    term.write((" RIFT LAUNCHER // FILE BROWSER"):sub(1, width))
+    term.setTextColor(term.isColor() and colors.black or colors.white)
+    term.write((" RIFT LAUNCHER // FILE BROWSER" .. string.rep(" ", width)):sub(1, width))
+    term.setTextColor(colors.white)
     term.setBackgroundColor(colors.black)
     term.setCursorPos(2, 2)
     term.setTextColor(colors.lightGray)
@@ -619,11 +621,12 @@ local function runSelected()
         return
     end
 
-    local ok, result = pcall(runProfileProgram, "/" .. entry.path)
+    local ok, result, runError = pcall(runProfileProgram, "/" .. entry.path)
     if not ok then
         message = "Could not run " .. entry.name .. ": " .. tostring(result)
     elseif result == false then
-        message = "The program did not complete successfully."
+        message = runError and ("Error in " .. entry.name .. ": " .. tostring(runError))
+            or "The program did not complete successfully."
     else
         message = "Returned from " .. entry.name .. "."
     end
@@ -1185,13 +1188,15 @@ local function commandPrompt()
                         for index = 2, #arguments do
                             table.insert(programArguments, arguments[index])
                         end
-                        local ok, result = pcall(runProfileProgram,
+                        local ok, result, runError = pcall(runProfileProgram,
                             "/" .. programPath, table.unpack(programArguments))
                         loadTheme()
                         width = term.getSize()
                         if not ok then
                             writePromptLine(tostring(result), colors.red)
-                        elseif result ~= false then
+                        elseif result == false then
+                            if runError then writePromptLine(tostring(runError), colors.red) end
+                        else
                             drawPromptHeader()
                         end
                     end
