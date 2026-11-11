@@ -3,6 +3,7 @@ local SYSTEM_APP_DIRECTORY = "/.launcher/apps"
 local DOWNLOADER_PATH = SYSTEM_APP_DIRECTORY .. "/app-downloader.lua"
 local SYSTEM_FILE_BROWSER_PATH = SYSTEM_APP_DIRECTORY .. "/file-browser.lua"
 local LUA_CONSOLE_PATH = "/.launcher/recovery/apps/lua-console.lua"
+local RECOVERY_PROFILE_INSPECTOR_PATH = "recovery://profile-inspector"
 local LEGACY_CLOUD_PATH = SYSTEM_APP_DIRECTORY .. "/cloud.lua"
 local SETTINGS_PROGRAM_PATH = SYSTEM_APP_DIRECTORY .. "/settings.lua"
 local HOST_BASE_URL = "https://rift.zerocreates.org/"
@@ -110,6 +111,7 @@ local message = ""
 local currentUser
 local homeDirectory
 local recoverySession = false
+local showRecoveryProfileInspector
 local profilePasswords = {}
 local profileAdmins = {}
 local authorizedProfiles = {}
@@ -1988,6 +1990,7 @@ local function refreshApps()
         if fs.exists(recoveryConsole) and not fs.isDir(recoveryConsole) then
             apps[#apps + 1] = { path = recoveryConsole, name = "Lua Console" }
         end
+        apps[#apps + 1] = { path = RECOVERY_PROFILE_INSPECTOR_PATH, name = "Profile Inspector" }
         selected, firstVisible = 1, 1
         if #apps == 0 then message = "System File Browser is not installed." end
         return
@@ -2647,11 +2650,11 @@ local function runHomeProgram(programPath, profileContext, ...)
                         local moved, moveError = pcall(nativeFs.move, temporary, path)
                         if not moved then
                             if nativeFs.exists(temporary) then nativeFs.delete(temporary) end
-                            local restored, restoreError = pcall(nativeFs.move, backup, path)
+                            restoredt, restoreErrort = pcall(nativeFs.move, backup, path)
                             error("Could not install encrypted storage file " .. relativePath .. ": "
                                 .. tostring(moveError)
-                                .. (restored and "" or "; restoring the backup also failed: "
-                                    .. tostring(restoreError)), 0)
+                                .. (restoredt and "" or "; restoring the backup also failed: "
+                                    .. tostring(restoreErrort)), 0)
                         end
                         nativeFs.delete(backup)
                     end
@@ -4370,7 +4373,9 @@ local function launchSelected()
         bootLog("APP end " .. tostring(app.name) .. " ok=" .. tostring(results[2]) .. " result=" .. tostring(results[3]))
         return table.unpack(results, 2, results.n)
     end
-    if isInHomeDirectory(app.path) then
+    if app.path == RECOVERY_PROFILE_INSPECTOR_PATH then
+        ok, result = protectedRun(showRecoveryProfileInspector)
+    elseif isInHomeDirectory(app.path) then
         ok, result = protectedRun(runHomeProgram, app.path, profileContext, profileContext.homeDirectory)
     elseif app.path:gsub("^/+", "") == SYSTEM_FILE_BROWSER_PATH:gsub("^/+", "") then
         local function runProfileProgram(path, ...)
@@ -4581,6 +4586,7 @@ bootFlow.signIn = function()
     if recoveryLoginRequested then
         local passwords, passwordError = loadProfilePasswords()
         if not passwords then error(passwordError, 0) end
+        profilePasswords = passwords
         term.setBackgroundColor(colors.black)
         term.setTextColor(colors.white)
         term.clear()
@@ -4674,6 +4680,304 @@ bootFlow.completeBoot = function(systemAppInstallMessage)
     bootLog("Boot complete; update marker cleared")
     if not recoverySession then bgServices.startAutomatic() end
     if systemAppInstallMessage then bootLog(systemAppInstallMessage) end
+end
+
+showRecoveryProfileInspector = function()
+    if not recoverySession then error("Profile Inspector is only available to the recovery account.", 0) end
+    local selectedProfile = 1
+    local status = ""
+
+    local function listProfiles()
+        local profiles = {}
+        for _, name in ipairs(fs.list(USER_ROOT)) do
+            if name ~= "default" and name:match("^[%w_-]+$")
+                and fs.isDir(fs.combine(USER_ROOT, name)) then
+                profiles[#profiles + 1] = name
+            end
+        end
+        table.sort(profiles, function(first, second) return first:lower() < second:lower() end)
+        return profiles
+    end
+
+    local function countProfileAdmins()
+        local count = 0
+        for name, isAdmin in pairs(profileAdmins) do
+            if name ~= "default" and isAdmin == true and fs.isDir(fs.combine(USER_ROOT, name)) then
+                count = count + 1
+            end
+        end
+        return count
+    end
+
+    local function copyMap(source)
+        local result = {}
+        for key, value in pairs(source) do result[key] = value end
+        return result
+    end
+
+    local function drawInspector(profiles)
+        local width, height = term.getSize()
+        local visibleRows = math.max(1, height - 8)
+        selectedProfile = math.max(1, math.min(selectedProfile, math.max(1, #profiles)))
+        local first = math.max(1, math.min(selectedProfile, math.max(1, #profiles - visibleRows + 1)))
+        local last = math.min(#profiles, first + visibleRows - 1)
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.setBackgroundColor(term.isColor() and colors.cyan or colors.gray)
+        term.write((" PROFILE INSPECTOR" .. string.rep(" ", width)):sub(1, width))
+        term.setBackgroundColor(colors.black)
+        term.setCursorPos(2, 2)
+        term.setTextColor(colors.lightGray)
+        term.write((#profiles .. (#profiles == 1 and " profile" or " profiles")):sub(1, width - 2))
+
+        for index = first, last do
+            local name = profiles[index]
+            local role = profileAdmins[name] and "ADMIN" or "STANDARD"
+            local password = profilePasswords[name] and "PASSWORD SET" or "NO PASSWORD"
+            local row = index - first + 4
+            term.setCursorPos(2, row)
+            if index == selectedProfile then
+                term.setBackgroundColor(colors.blue)
+                term.setTextColor(colors.white)
+            else
+                term.setTextColor(colors.white)
+            end
+            term.write(("  " .. name .. "  [" .. role .. "]  [" .. password .. "]")
+                :sub(1, math.max(0, width - 2)))
+            term.setBackgroundColor(colors.black)
+        end
+        if #profiles == 0 then
+            term.setCursorPos(2, 4)
+            term.setTextColor(colors.lightGray)
+            term.write("No user profiles found.")
+        end
+
+        local selectedName = profiles[selectedProfile]
+        if selectedName then
+            term.setCursorPos(2, height - 3)
+            term.setTextColor(colors.lightGray)
+            term.write(("Home: H@" .. selectedName .. "://")
+                :sub(1, math.max(0, width - 2)))
+        end
+        term.setCursorPos(2, height - 2)
+        term.setTextColor(colors.yellow)
+        term.write(tostring(status):sub(1, math.max(0, width - 2)))
+        local buttons = {
+            { label = "RESET PW", action = "password" },
+            { label = "ROLE", action = "role" },
+            { label = "DELETE", action = "delete" },
+            { label = "BACK", action = "back" },
+        }
+        local buttonRow = height
+        drawButtons(buttons, buttonRow, width, term.isColor())
+        return buttons, first, last, visibleRows, buttonRow
+    end
+
+    local function resetPassword(username)
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.clear()
+        term.setCursorPos(1, 1)
+        print("RESET PASSWORD FOR " .. username)
+        write("New password: ")
+        local password = readPassword()
+        if password == "" then
+            status = "Password cannot be empty."
+            return
+        end
+        write("Confirm password: ")
+        if readPassword() ~= password then
+            status = "Passwords did not match."
+            return
+        end
+        local passwords = copyMap(profilePasswords)
+        passwords[username] = password
+        local ok, saved, saveError = pcall(saveProfilePasswords, passwords)
+        if not ok or not saved then
+            status = "Could not save the new password: " .. tostring(ok and saveError or saved)
+            return
+        end
+        profilePasswords = passwords
+        status = "Password reset for " .. username .. "."
+    end
+
+    local function toggleRole(username)
+        local admins = copyMap(profileAdmins)
+        if admins[username] then
+            if countProfileAdmins() <= 1 then
+                status = "The last regular admin cannot be demoted."
+                return
+            end
+            admins[username] = nil
+        else
+            admins[username] = true
+        end
+        local ok, saved, saveError = pcall(saveProfileAdmins, admins)
+        if not ok or not saved then
+            status = "Could not save the role change: " .. tostring(ok and saveError or saved)
+            return
+        end
+        profileAdmins = admins
+        status = username .. " is now " .. (admins[username] and "an admin." or "a standard user.")
+    end
+
+    local function confirmDelete(username)
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.setTextColor(colors.red)
+        print("DELETE PROFILE")
+        term.setTextColor(colors.white)
+        print("This permanently removes " .. username .. " and their private data.")
+        print("Type the username to confirm: ")
+        return read() == username
+    end
+
+    local function deleteProfile(username)
+        if profileAdmins[username] and countProfileAdmins() <= 1 then
+            status = "The last regular admin cannot be deleted."
+            return
+        end
+        if not confirmDelete(username) then
+            status = "Profile deletion cancelled."
+            return
+        end
+
+        local trashDirectory = SYSTEM_DIRECTORY .. "/account-trash"
+        local profilePath = fs.combine(USER_ROOT, username)
+        local privatePath = fs.combine(SYSTEM_DIRECTORY, "user-data", username)
+        local trashedProfile = fs.combine(trashDirectory, username)
+        local trashedPrivate = fs.combine(trashDirectory, username .. "-private")
+        if fs.exists(trashedProfile) or fs.exists(trashedPrivate) then
+            status = "A previous deletion archive exists; profile was not changed."
+            return
+        end
+        local made, makeError = pcall(fs.makeDir, trashDirectory)
+        if not made then
+            status = "Could not prepare profile deletion: " .. tostring(makeError)
+            return
+        end
+
+        local movedProfile, profileError = pcall(fs.move, profilePath, trashedProfile)
+        if not movedProfile then
+            status = "Could not stage profile: " .. tostring(profileError)
+            return
+        end
+        local hasPrivateData = fs.exists(privatePath)
+        if hasPrivateData then
+            local movedPrivate, privateError = pcall(fs.move, privatePath, trashedPrivate)
+            if not movedPrivate then
+                local restored, restoreError = pcall(fs.move, trashedProfile, profilePath)
+                status = "Could not stage private data: " .. tostring(privateError)
+                    .. (restored and "" or "; profile restore failed: " .. tostring(restoreError))
+                return
+            end
+        end
+
+        local passwords, admins = copyMap(profilePasswords), copyMap(profileAdmins)
+        passwords[username], admins[username] = nil, nil
+        local passwordsSaved, passwordError = saveProfilePasswords(passwords)
+        if not passwordsSaved then
+            local rollbackErrors = {}
+            local restoredProfile, restoreProfileError = pcall(fs.move, trashedProfile, profilePath)
+            if not restoredProfile then rollbackErrors[#rollbackErrors + 1] = tostring(restoreProfileError) end
+            if hasPrivateData then
+                local restoredPrivate, restorePrivateError = pcall(fs.move, trashedPrivate, privatePath)
+                if not restoredPrivate then rollbackErrors[#rollbackErrors + 1] = tostring(restorePrivateError) end
+            end
+            status = tostring(passwordError)
+                .. (#rollbackErrors > 0 and ("; rollback failed: " .. table.concat(rollbackErrors, "; ")) or "")
+            return
+        end
+
+        local adminsCallOk, adminsSaved, adminError = pcall(saveProfileAdmins, admins)
+        if not adminsCallOk or not adminsSaved then
+            local restoredPasswords, restorePasswordError = saveProfilePasswords(profilePasswords)
+            local rollbackErrors = {}
+            if not restoredPasswords then rollbackErrors[#rollbackErrors + 1] = tostring(restorePasswordError) end
+            local restoredProfile, restoreProfileError = pcall(fs.move, trashedProfile, profilePath)
+            if not restoredProfile then rollbackErrors[#rollbackErrors + 1] = tostring(restoreProfileError) end
+            if hasPrivateData then
+                local restoredPrivate, restorePrivateError = pcall(fs.move, trashedPrivate, privatePath)
+                if not restoredPrivate then rollbackErrors[#rollbackErrors + 1] = tostring(restorePrivateError) end
+            end
+            status = "Could not save account roles: " .. tostring(adminsCallOk and adminError or adminsSaved)
+                .. (#rollbackErrors > 0 and ("; rollback failed: " .. table.concat(rollbackErrors, "; ")) or "")
+            return
+        end
+
+        profilePasswords, profileAdmins = passwords, admins
+        authorizedProfiles[username] = nil
+        bgServices.clearUserServices(username)
+        local cleanupErrors = {}
+        for _, path in ipairs({ trashedProfile, trashedPrivate }) do
+            if fs.exists(path) then
+                local removed, removeError = pcall(fs.delete, path)
+                if not removed or fs.exists(path) then
+                    cleanupErrors[#cleanupErrors + 1] = path .. ": " .. tostring(removeError or "could not remove")
+                end
+            end
+        end
+        local preferencesChanged = false
+        if settings.autoLoginUser == username then
+            settings.autoLoginUser = nil
+            preferencesChanged = true
+        end
+        local profilePrefix = fs.combine(USER_ROOT, username) .. "/"
+        if type(settings.autoLaunchPath) == "string"
+            and settings.autoLaunchPath:sub(1, #profilePrefix) == profilePrefix then
+            settings.autoLaunchPath = nil
+            preferencesChanged = true
+        end
+        if preferencesChanged and not saveSettings() then
+            status = "Profile deleted, but automatic login/launch preferences could not be cleared."
+        elseif #cleanupErrors > 0 then
+            status = "Profile deleted, but staged data remains: " .. table.concat(cleanupErrors, "; ")
+        else
+            status = "Deleted profile " .. username .. "."
+        end
+    end
+
+    while true do
+        local profiles = listProfiles()
+        if selectedProfile > #profiles then selectedProfile = math.max(1, #profiles) end
+        local buttons, firstVisible, lastVisible, visibleRows, buttonRow = drawInspector(profiles)
+        local event, key, x, y = os.pullEventRaw()
+        if event == "key" then
+            if key == keys.up then
+                selectedProfile = math.max(1, selectedProfile - 1)
+            elseif key == keys.down then
+                selectedProfile = math.min(#profiles, selectedProfile + 1)
+            elseif key == keys.enter and profiles[selectedProfile] then
+                resetPassword(profiles[selectedProfile])
+            elseif key == keys.p and profiles[selectedProfile] then
+                resetPassword(profiles[selectedProfile])
+            elseif key == keys.r and profiles[selectedProfile] then
+                toggleRole(profiles[selectedProfile])
+            elseif key == keys.delete and profiles[selectedProfile] then
+                deleteProfile(profiles[selectedProfile])
+            elseif key == keys.escape then
+                return true
+            end
+        elseif event == "mouse_scroll" then
+            selectedProfile = math.max(1, math.min(#profiles, selectedProfile + key))
+        elseif event == "mouse_click" and key == 1 then
+            local clickedProfile = firstVisible + y - 4
+            if y >= 4 and y <= 3 + visibleRows and clickedProfile <= lastVisible then
+                selectedProfile = clickedProfile
+            elseif y == buttonRow then
+                local action = buttonAt(buttons, x)
+                local username = profiles[selectedProfile]
+                if action == "back" then return true end
+                if username and action == "password" then resetPassword(username) end
+                if username and action == "role" then toggleRole(username) end
+                if username and action == "delete" then deleteProfile(username) end
+            end
+        end
+    end
 end
 
 local function recoveryToolsMenu()

@@ -217,6 +217,15 @@ local function displayPath(path)
     if isWithinRoot(normalizedPath, homeDirectory) then
         return "H://" .. normalizedPath:sub(#homeDirectory + 2)
     end
+    if normalizedPath == "users" then return "[USERS]" end
+    if recoveryMode and currentRoot == "/" then
+        local otherUsername, profilePath = normalizedPath:match("^users/([%w_-]+)/?(.*)$")
+        if otherUsername then
+            local suffix = profilePath == "" and "" or profilePath
+            return "H@" .. otherUsername .. "://" .. suffix
+        end
+        return "ROOT://" .. normalizedPath
+    end
     if originalPath:sub(1, 1) == "/" then return "ROOT://" .. normalizedPath end
     return path
 end
@@ -352,14 +361,14 @@ local function refreshEntries()
     else
         if recoveryMode then
             table.insert(updated, {
-                name = "[Main Directory]",
+                name = "ROOT://",
                 path = "/",
                 isDirectory = true,
                 mainRoot = true,
             })
         end
         table.insert(updated, {
-            name = "[Other Users]",
+            name = "[Users]",
             path = profilesDirectory,
             isDirectory = true,
             profilesRoot = true,
@@ -376,7 +385,7 @@ local function refreshEntries()
 
     if currentRoot == homeDirectory and altHeld then
         table.insert(updated, {
-            name = "[Private Data]",
+            name = "PD://",
             path = privateDataDirectory,
             isDirectory = true,
             privateDataRoot = true,
@@ -388,9 +397,10 @@ local function refreshEntries()
             local path = fs.combine(currentDirectory, name)
             if (altHeld or name:sub(1, 1) ~= ".") and not isRecoveryProtectedPath(path) then
                 table.insert(updated, {
-                    name = name,
+                    name = recoveryMode and currentRoot == "/" and name == "users" and "[USERS]" or name,
                     path = path,
                     isDirectory = fs.isDir(path),
+                    hideDirectorySuffix = recoveryMode and currentRoot == "/" and name == "users",
                 })
             end
         end
@@ -505,7 +515,7 @@ local function draw()
     for index = firstVisible, lastVisible do
         local row = index - firstVisible + 3
         local entry = entries[index]
-        local label = entry.name .. (entry.isDirectory and "/" or "")
+        local label = entry.name .. (entry.isDirectory and not entry.hideDirectorySuffix and "/" or "")
         term.setCursorPos(2, row)
         if index == selected then
             term.setBackgroundColor(highlight)
