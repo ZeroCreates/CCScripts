@@ -803,7 +803,7 @@ local function drawMonitorDashboard(page, pageNumber, pageCount, rowsPerPage, bo
             counted = counted + 1
             local statusColor = job.status == "open" and good
                 or (job.status == "completed" and muted or warning)
-            if counted >= page.offset and counted <= last then
+            if counted <= rowsPerPage then
                 add("#" .. job.id .. "  " .. job.status:upper() .. "  |  "
                     .. tostring(job.title or "untitled"), statusColor)
             end
