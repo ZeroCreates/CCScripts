@@ -797,51 +797,39 @@ local function drawMonitorDashboard(page, pageNumber, pageCount, rowsPerPage, bo
             math.floor((os.clock() - startedAt) % 60)), muted)
         add("LAST REQUEST  |  " .. lastRequest, warning)
     elseif page.type == "jobs" then
-        if page.count == 0 then
-            add("No jobs have been posted.", muted)
-        else
-            local last = math.min(page.offset + rowsPerPage - 1, page.count)
-            local counted = 0
-            for _, job in pairs(state.jobs) do
-                counted = counted + 1
-                local statusColor = job.status == "open" and good
-                    or (job.status == "completed" and muted or warning)
-                if counted >= page.offset and counted <= last then
-                    add("#" .. job.id .. "  " .. job.status:upper() .. "  |  "
-                        .. tostring(job.title or "untitled"), statusColor)
-                end
+        local last = math.min(page.offset + rowsPerPage - 1, page.count)
+        local counted = 0
+        for _, job in pairs(state.jobs) do
+            counted = counted + 1
+            local statusColor = job.status == "open" and good
+                or (job.status == "completed" and muted or warning)
+            if counted >= page.offset and counted <= last then
+                add("#" .. job.id .. "  " .. job.status:upper() .. "  |  "
+                    .. tostring(job.title or "untitled"), statusColor)
             end
         end
     elseif page.type == "orders" then
-        if page.count == 0 then
-            add("No market orders have been placed.", muted)
-        else
-            local last = math.min(page.offset + rowsPerPage - 1, page.count)
-            for index = page.offset, last do
-                local order = market.orders[index]
-                local total = type(order.total) == "number"
-                    and ("$" .. string.format("%.2f", order.total / 100)) or "total n/a"
-                add(tostring(order.reference or ("#" .. tostring(order.id))) .. "  "
-                    .. tostring(order.status):upper() .. "  " .. total .. "  |  "
-                    .. tostring(order.customerUser or "unknown") .. " -> "
-                    .. tostring(order.providerUser or "unknown"),
-                    order.status == "preparing" and warning or muted)
-            end
+        local last = math.min(page.offset + rowsPerPage - 1, page.count)
+        for index = page.offset, last do
+            local order = market.orders[index]
+            local total = type(order.total) == "number"
+                and ("$" .. string.format("%.2f", order.total / 100)) or "total n/a"
+            add(tostring(order.reference or ("#" .. tostring(order.id))) .. "  "
+                .. tostring(order.status):upper() .. "  " .. total .. "  |  "
+                .. tostring(order.customerUser or "unknown") .. " -> "
+                .. tostring(order.providerUser or "unknown"),
+                order.status == "preparing" and warning or muted)
         end
     elseif page.type == "products" then
-        if page.count == 0 then
-            add("No market products have been published.", muted)
-        else
-            local last = math.min(page.offset + rowsPerPage - 1, page.count)
-            for index = page.offset, last do
-                local product = market.products[index]
-                local price = type(product.price) == "number"
-                    and ("$" .. string.format("%.2f", product.price / 100)) or "price n/a"
-                add((product.available and "LIVE" or "PAUSED") .. "  "
-                    .. tostring(product.name or "unnamed") .. "  |  " .. price .. "  by "
-                    .. tostring(product.providerName or product.providerUser or "unknown"),
-                    product.available and good or muted)
-            end
+        local last = math.min(page.offset + rowsPerPage - 1, page.count)
+        for index = page.offset, last do
+            local product = market.products[index]
+            local price = type(product.price) == "number"
+                and ("$" .. string.format("%.2f", product.price / 100)) or "price n/a"
+            add((product.available and "LIVE" or "PAUSED") .. "  "
+                .. tostring(product.name or "unnamed") .. "  |  " .. price .. "  by "
+                .. tostring(product.providerName or product.providerUser or "unknown"),
+                product.available and good or muted)
         end
     elseif page.type == "services" then
         add("RIFT ACCOUNTS  |  " .. ACCOUNT_PROTOCOL .. " @ " .. LOGIN_SERVER_NAME, good)
@@ -857,21 +845,17 @@ local function drawMonitorDashboard(page, pageNumber, pageCount, rowsPerPage, bo
             .. getMailStats().messages .. " messages", muted)
         add("DATA  |  jobs.db  /  accounts.db  /  market data  /  Rift Mail data  /  casino wallets", muted)
     elseif page.type == "sessions" then
-        if page.count == 0 then
-            add("No users are currently signed in.", muted)
-        else
-            local activeSessions = {}
-            for computerId, username in pairs(sessions) do
-                table.insert(activeSessions, { computerId = computerId, username = username })
-            end
-            table.sort(activeSessions, function(first, second)
-                return first.username:lower() < second.username:lower()
-            end)
-            local last = math.min(page.offset + rowsPerPage - 1, #activeSessions)
-            for index = page.offset, last do
-                local session = activeSessions[index]
-                add(session.username .. "  |  computer #" .. session.computerId, good)
-            end
+        local activeSessions = {}
+        for computerId, username in pairs(sessions) do
+            table.insert(activeSessions, { computerId = computerId, username = username })
+        end
+        table.sort(activeSessions, function(first, second)
+            return first.username:lower() < second.username:lower()
+        end)
+        local last = math.min(page.offset + rowsPerPage - 1, #activeSessions)
+        for index = page.offset, last do
+            local session = activeSessions[index]
+            add(session.username .. "  |  computer #" .. session.computerId, good)
         end
     end
 
