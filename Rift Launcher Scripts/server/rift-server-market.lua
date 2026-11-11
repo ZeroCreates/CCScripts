@@ -542,7 +542,6 @@ local function cleanupExpiredOrders()
     end
     if removed then
         saveState()
-        drawDashboard()
     end
     return removed
 end
@@ -585,7 +584,6 @@ local function handleMarketRequest(senderId, message)
     else
         sendError(senderId, "Unknown request.")
     end
-    drawDashboard()
 end
 
 return handleMarketRequest, getDashboardStats, cleanupExpiredOrders
