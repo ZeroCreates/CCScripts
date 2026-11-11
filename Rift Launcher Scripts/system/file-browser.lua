@@ -346,6 +346,7 @@ local function refreshEntries()
                         isDirectory = true,
                         profileRoot = true,
                         username = username,
+                        hideDirectorySuffix = true,
                     })
                 end
             end
@@ -365,6 +366,7 @@ local function refreshEntries()
                 path = "/",
                 isDirectory = true,
                 mainRoot = true,
+                hideDirectorySuffix = true,
             })
         end
         table.insert(updated, {
@@ -372,6 +374,7 @@ local function refreshEntries()
             path = profilesDirectory,
             isDirectory = true,
             profilesRoot = true,
+            hideDirectorySuffix = true,
         })
         for _, mount in ipairs(diskMounts) do
             table.insert(updated, {
@@ -379,6 +382,7 @@ local function refreshEntries()
                 path = mount.path,
                 isDirectory = true,
                 diskRoot = true,
+                hideDirectorySuffix = true,
             })
         end
     end
@@ -389,6 +393,7 @@ local function refreshEntries()
             path = privateDataDirectory,
             isDirectory = true,
             privateDataRoot = true,
+            hideDirectorySuffix = true,
         })
     end
 

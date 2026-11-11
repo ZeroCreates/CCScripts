@@ -801,12 +801,15 @@ local function drawMonitorDashboard(page, pageNumber, pageCount, rowsPerPage, bo
             add("No jobs have been posted.", muted)
         else
             local last = math.min(page.offset + rowsPerPage - 1, page.count)
-            for index = page.offset, last do
-                local job = state.jobs[page.count - index + 1]
+            local counted = 0
+            for _, job in pairs(state.jobs) do
+                counted = counted + 1
                 local statusColor = job.status == "open" and good
                     or (job.status == "completed" and muted or warning)
-                add("#" .. job.id .. "  " .. job.status:upper() .. "  " .. job.title
-                    .. "  |  by " .. tostring(job.posterName or job.posterUser or "unknown"), statusColor)
+                if counted >= page.offset and counted <= last then
+                    add("#" .. job.id .. "  " .. job.status:upper() .. "  |  "
+                        .. tostring(job.title or "untitled"), statusColor)
+                end
             end
         end
     elseif page.type == "orders" then
