@@ -1981,6 +1981,41 @@ local function loadCatalogNames()
 end
 
 local function refreshApps()
+    local userFilesDirectory = fs.combine(homeDirectory, "Files")
+    fs.makeDir(userFilesDirectory)
+    local function moveProfileFolder(source, destination)
+        if not fs.exists(source) then return true end
+        if not fs.exists(destination) then return pcall(fs.move, source, destination) end
+        if not fs.isDir(source) or not fs.isDir(destination) then
+            return false, "the destination is not a folder"
+        end
+        for _, name in ipairs(fs.list(source)) do
+            local base, extension = name:match("^(.*)(%.[^%.]+)$")
+            if not base then base, extension = name, "" end
+            local destinationName = name
+            local suffix = 2
+            while fs.exists(fs.combine(destination, destinationName)) do
+                destinationName = base .. " (" .. suffix .. ")" .. extension
+                suffix = suffix + 1
+            end
+            local moved, moveError = pcall(fs.move,
+                fs.combine(source, name), fs.combine(destination, destinationName))
+            if not moved then return false, moveError end
+        end
+        fs.delete(source)
+        return true
+    end
+    for _, directory in ipairs({ "desktop", "Documents", "Downloads", "Audio" }) do
+        local legacyDirectory = fs.combine(homeDirectory, directory)
+        local destination = fs.combine(userFilesDirectory,
+            directory == "desktop" and "Desktop" or directory)
+        local moved, moveError = moveProfileFolder(legacyDirectory, destination)
+        if not moved then
+            message = "Could not move the old " .. directory .. " folder: " .. tostring(moveError)
+        end
+        if not fs.exists(destination) then fs.makeDir(destination) end
+    end
+
     if recoverySession then
         apps = {}
         if fs.exists(SYSTEM_FILE_BROWSER_PATH) and not fs.isDir(SYSTEM_FILE_BROWSER_PATH) then
@@ -2013,8 +2048,7 @@ local function refreshApps()
 
     local appDirectory = fs.combine(homeDirectory, "apps")
     fs.makeDir(appDirectory)
-    local desktopDirectory = fs.combine(homeDirectory, "desktop")
-    fs.makeDir(desktopDirectory)
+    local desktopDirectory = fs.combine(userFilesDirectory, "Desktop")
 
     local migrationErrors = {}
     for _, name in ipairs(fs.list(homeDirectory)) do
@@ -2404,6 +2438,12 @@ local function runHomeProgram(programPath, profileContext, ...)
     end
 
     local virtualDirectory = ""
+    local locationDirectories = {
+        desktop = "Files/Desktop",
+        documents = "Files/Documents",
+        downloads = "Files/Downloads",
+        audio = "Files/Audio",
+    }
     local function normalizeSegments(path, initialDirectory)
         local segments = {}
         for segment in (initialDirectory or ""):gmatch("[^/]+") do
@@ -2423,6 +2463,10 @@ local function runHomeProgram(programPath, profileContext, ...)
         if type(path) ~= "string" then
             error("Filesystem paths must be strings.", 0)
         end
+        path = path:gsub("%%([%w_]+)%%", function(location)
+            local directory = locationDirectories[location:lower()]
+            return directory and ("/" .. directory) or ("%" .. location .. "%")
+        end)
         local alias, aliasPath = path:match("^([%w@#]+://)(.*)$")
         if alias then return alias .. normalizeSegments(aliasPath) end
         local initialDirectory = path:sub(1, 1) ~= "/" and virtualDirectory or ""
