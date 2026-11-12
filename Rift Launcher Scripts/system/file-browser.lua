@@ -365,6 +365,7 @@ local function refreshEntries()
                 name = "ROOT://",
                 path = "/",
                 isDirectory = true,
+                isSystemDirectory = true,
                 mainRoot = true,
                 hideDirectorySuffix = true,
             })
@@ -374,6 +375,7 @@ local function refreshEntries()
             path = profilesDirectory,
             isDirectory = true,
             profilesRoot = true,
+                isSystemDirectory = true,
             hideDirectorySuffix = true,
         })
         for _, mount in ipairs(diskMounts) do
@@ -381,6 +383,7 @@ local function refreshEntries()
                 name = displayPath(mount.path),
                 path = mount.path,
                 isDirectory = true,
+                isSystemDirectory = true,
                 diskRoot = true,
                 hideDirectorySuffix = true,
             })
@@ -392,6 +395,7 @@ local function refreshEntries()
             name = "PD://",
             path = privateDataDirectory,
             isDirectory = true,
+            isSystemDirectory = true,
             privateDataRoot = true,
             hideDirectorySuffix = true,
         })
@@ -528,7 +532,7 @@ local function draw()
             term.write(("> " .. label):sub(1, math.max(0, width - 2)))
             term.setBackgroundColor(colors.black)
         else
-            term.setTextColor(entry.isDirectory and (term.isColor() and accent or colors.white) or colors.white)
+            term.setTextColor(entry.isSystemDirectory and colors.red or (entry.isDirectory and (term.isColor() and accent or colors.white) or colors.white))   
             term.write(("  " .. label):sub(1, math.max(0, width - 2)))
         end
     end
