@@ -2691,12 +2691,12 @@ local function runHomeProgram(programPath, profileContext, ...)
                             error("Could not back up private storage file " .. relativePath .. ": "
                                 .. tostring(backupError), 0)
                         end
-                        local moved, moveError = pcall(nativeFs.move, temporary, path)
-                        if not moved then
+                        movedt, moveErrort = pcall(nativeFs.move, temporary, path)
+                        if not movedt then
                             if nativeFs.exists(temporary) then nativeFs.delete(temporary) end
                             restoredt, restoreErrort = pcall(nativeFs.move, backup, path)
                             error("Could not install encrypted storage file " .. relativePath .. ": "
-                                .. tostring(moveError)
+                                .. tostring(moveErrort)
                                 .. (restoredt and "" or "; restoring the backup also failed: "
                                     .. tostring(restoreErrort)), 0)
                         end

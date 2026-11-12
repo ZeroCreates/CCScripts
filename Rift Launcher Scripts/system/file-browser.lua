@@ -10,7 +10,7 @@ local shellDirectory = fs.combine(homeDirectory, "shell")
 local encryptionKeyPath = "/.launcher/.data-key"
 local profilesDirectory = "users"
 local SHARE_UPLOAD_URL = "https://rift.zerocreates.org/api/share"
-local currentDirectory = fs.combine(homeDirectory, "desktop")
+local currentDirectory = fs.combine(homeDirectory, "Files/Desktop")
 local currentRoot = homeDirectory
 local authorizedProfileRoot
 local diskMounts = {}
