@@ -31,7 +31,6 @@ local dimensions = {
 }
 local message = "SYSTEM READY"
 local placeToDelete
-local savePlaceId = 1
 local deleteMode = false
 
 term.setCursorBlink(false)
@@ -64,6 +63,68 @@ local function status()
     end
 
     return result
+end
+
+local destinationsPath = "/tardis_destinations.json"
+
+local function loadDestinations()
+    if not fs.exists(destinationsPath) then
+        return {}
+    end
+
+    local file = fs.open(destinationsPath, "r")
+    if not file then
+        return nil, "Unable to open destination file."
+    end
+
+    local contents = file.readAll()
+    file.close()
+
+    local ok, places = pcall(textutils.unserialiseJSON, contents)
+    if not ok or type(places) ~= "table" then
+        return nil, "Destination file is invalid."
+    end
+
+    return places
+end
+
+local function saveDestinations(places)
+    local ok, contents = pcall(textutils.serialiseJSON, places)
+    if not ok then
+        return nil, "Unable to encode destinations."
+    end
+
+    local file = fs.open(destinationsPath, "w")
+    if not file then
+        return nil, "Unable to write destination file."
+    end
+
+    file.write(contents)
+    file.close()
+    return true
+end
+
+local function getCurrentDestination(name)
+    local current, err = status()
+    if not current then
+        return nil, err
+    end
+
+    for _, field in ipairs({"x", "y", "z", "dimension", "heading"}) do
+        if current[field] == nil then
+            return nil, "TARDIS status is missing " .. field .. "."
+        end
+    end
+
+    return {
+        name = name,
+        x = current.x,
+        y = current.y,
+        z = current.z,
+        dimension = current.dimension,
+        heading = current.heading,
+        land = true
+    }
 end
 
 -- ==========================================
@@ -429,7 +490,7 @@ end
 local function drawMemory()
     header("MEMORY SYSTEM")
 
-    local places, err = call("getPlaces")
+    local places, err = loadDestinations()
 
     printAt(2, 4, "SAVED LOCATIONS")
     printAt(
@@ -446,7 +507,12 @@ local function drawMemory()
             if type(value) == "table" and type(value.name) == "string" then
                 savedPlaces[#savedPlaces + 1] = {
                     id = id,
-                    name = value.name
+                    name = value.name,
+                    x = value.x,
+                    y = value.y,
+                    z = value.z,
+                    dimension = value.dimension,
+                    heading = value.heading
                 }
             end
         end
@@ -466,15 +532,25 @@ local function drawMemory()
 
                 local selectedPlace = place
                 button(2, y, width - 3, selectedPlace.name, "place", function()
-                    local placeId = tonumber(selectedPlace.id) or selectedPlace.id
                     if deleteMode then
                         placeToDelete = {
-                            id = placeId,
+                            id = selectedPlace.id,
                             name = selectedPlace.name
                         }
                         page = "confirm_delete"
                     else
-                        local _, commandError = call("goPlace", placeId)
+                        local _, commandError = call(
+                            "setCourse",
+                            selectedPlace.x,
+                            selectedPlace.y,
+                            selectedPlace.z,
+                            selectedPlace.dimension,
+                            true,
+                            selectedPlace.heading
+                        )
+                        if not commandError then
+                            _, commandError = call("demat")
+                        end
                         notify(commandError or ("Going to " .. selectedPlace.name))
                     end
                 end, deleteMode and colors.red or colors.blue)
@@ -482,23 +558,12 @@ local function drawMemory()
             end
         end
     else
-        printAt(2, 7, "Unable to load locations.")
+        printAt(2, 7, err or "Unable to load locations.")
         printAt(2, 8, tostring(err))
     end
 
     if not deleteMode then
         addButton(height - 4, "SAVE LOCATION", "save", function()
-            local currentPlaces, placesError = call("getPlaces")
-            if type(currentPlaces) ~= "table" then
-                notify(placesError or "Unable to load locations.")
-                return
-            end
-
-            savePlaceId = 1
-            while currentPlaces[savePlaceId]
-                or currentPlaces[tostring(savePlaceId)] do
-                savePlaceId = savePlaceId + 1
-            end
             page = "save_place"
         end, 1)
     end
@@ -522,36 +587,40 @@ end
 
 local function drawSavePlace()
     header("SAVE LOCATION")
-    printAt(2, 5, "Select a location ID to save.")
-    savePlaceId = read()
-    printAt(2, 7, "LOCATION ID: " .. tostring(savePlaceId), colors.cyan)
-    course = call("getCourse")
-    x= course.x
-    y= course.y
-    z= course.z
-    printAt(2, 9, "Current Position: " .. tostring(x) .. ", " .. tostring(y) .. ", " .. tostring(z), colors.white)
-    printAt(2, 10, "Enter a rotation value (0-360): ", colors.white)
-    rotation = read()
-    execute(
-            "setCourse",
-            x,
-            y,
-            z,
-            course.dimension,
-            true,
-            rotation
-        )
-    local currentPlaces, placesError = call("getPlaces")
-    if type(currentPlaces) ~= "table" then
-        notify(placesError or "Unable to load locations.")
-        return
-    end
-    if currentPlaces[savePlaceId] or currentPlaces[tostring(savePlaceId)] then
-        notify("That location ID is already in use.")
+    printAt(2, 5, "Enter a destination name:")
+    local name = read()
+    if name == "" then
+        notify("Destination name cannot be empty.")
+        page = "memory"
+        footer()
         return
     end
 
-    execute("savePlace", savePlaceId)
+    local places, placesError = loadDestinations()
+    if not places then
+        notify(placesError)
+        page = "memory"
+        footer()
+        return
+    end
+    if places[name] then
+        notify("That destination name is already in use.")
+        page = "memory"
+        footer()
+        return
+    end
+
+    local savedPlace, statusError = getCurrentDestination(name)
+    if not savedPlace then
+        notify(statusError)
+        page = "memory"
+        footer()
+        return
+    end
+
+    places[name] = savedPlace
+    local _, saveError = saveDestinations(places)
+    notify(saveError or "Location saved.")
     page = "memory"
 
     footer()
@@ -563,7 +632,17 @@ local function drawDeleteConfirmation()
     center(8, placeToDelete.name)
 
     addButton(12, "YES, DELETE", "delete_confirm", function()
-        local _, commandError = call("deletePlace", placeToDelete.id)
+        local places, loadError = loadDestinations()
+        local commandError
+        if not places then
+            commandError = loadError
+        elseif not places[placeToDelete.id] then
+            commandError = "Destination no longer exists."
+        else
+            places[placeToDelete.id] = nil
+            local _, saveError = saveDestinations(places)
+            commandError = saveError
+        end
         notify(commandError or "Location deleted.")
         if not commandError then
             deleteMode = false

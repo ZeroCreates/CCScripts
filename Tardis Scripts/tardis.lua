@@ -153,6 +153,68 @@ local function getCourse()
     return course
 end
 
+local destinationsPath = "/tardis_destinations.json"
+
+local function loadDestinations()
+    if not fs.exists(destinationsPath) then
+        return {}
+    end
+
+    local file = fs.open(destinationsPath, "r")
+    if not file then
+        return nil, "Unable to open destination file."
+    end
+
+    local contents = file.readAll()
+    file.close()
+
+    local ok, places = pcall(textutils.unserialiseJSON, contents)
+    if not ok or type(places) ~= "table" then
+        return nil, "Destination file is invalid."
+    end
+
+    return places
+end
+
+local function saveDestinations(places)
+    local ok, contents = pcall(textutils.serialiseJSON, places)
+    if not ok then
+        return nil, "Unable to encode destinations."
+    end
+
+    local file = fs.open(destinationsPath, "w")
+    if not file then
+        return nil, "Unable to write destination file."
+    end
+
+    file.write(contents)
+    file.close()
+    return true
+end
+
+local function getCurrentDestination(name)
+    local current, err = call("getStatus")
+    if type(current) ~= "table" then
+        return nil, err or "Unable to read current TARDIS status."
+    end
+
+    for _, field in ipairs({"x", "y", "z", "dimension", "heading"}) do
+        if current[field] == nil then
+            return nil, "TARDIS status is missing " .. field .. "."
+        end
+    end
+
+    return {
+        name = name,
+        x = current.x,
+        y = current.y,
+        z = current.z,
+        dimension = current.dimension,
+        heading = current.heading,
+        land = true
+    }
+end
+
 local function drawHome()
     header("TARDIS SYSTEMS")
 
@@ -317,7 +379,7 @@ end
 local function drawMemory()
     header("TARDIS MEMORY BANK")
 
-    local places = call("getPlaces")
+    local places, placesError = loadDestinations()
 
     text(2, 5, "SAVED DESTINATIONS", C.cyan)
     text(
@@ -365,7 +427,7 @@ local function drawMemory()
             text(2, 7, "No saved destinations.", C.orange)
         end
     else
-        text(2, 7, "Unable to read Memory Bank.", C.orange)
+        text(2, 7, placesError or "Unable to read destinations.", C.orange)
     end
 
     if not deleteMode then
@@ -490,10 +552,8 @@ local function askName(prompt)
     term.setCursorPos(1, 1)
     print(prompt)
     local name = read()
-    print("Enter Rotation (0-360):")
-    local rotation = tonumber(read()) or 0
     term.redirect(monitor)
-    return name, rotation
+    return name
 end
 
 local function runCommand(method, successMessage, ...)
@@ -587,13 +647,24 @@ local function execute(id)
         runCommand("scan", "SCANNER ACTIVATED")
 
     elseif id == "save" then
-        local name, rotation = askName("Enter destination name:")
+        local name = askName("Enter destination name:")
         if name ~= "" then
-            course = getCourse()
-            local x, y, z = course.x, course.y, course.z
-            execute("setCourse", x, y, z, course.dimension, true, rotation)
-            local _, err = call("savePlace", name)
-            notify(err or "PLACE SAVED", err and C.red or C.lime)
+            local places, placesError = loadDestinations()
+            if not places then
+                notify(placesError, C.red)
+            elseif places[name] then
+                notify("DESTINATION NAME ALREADY EXISTS", C.red)
+            else
+                local savedPlace, statusError = getCurrentDestination(name)
+                if not savedPlace then
+                    notify(statusError, C.red)
+                else
+                    places[name] = savedPlace
+                    local _, saveError = saveDestinations(places)
+                    notify(saveError or "PLACE SAVED",
+                        saveError and C.red or C.lime)
+                end
+            end
         end
 
     elseif id == "delete" then
@@ -608,9 +679,19 @@ local function execute(id)
         notify("DELETE MODE CANCELLED", C.white)
 
     elseif id == "confirm_delete" and placeToDelete then
-        local _, err = call("deletePlace", placeToDelete.id)
-        notify(err or "PLACE DELETED", err and C.red or C.lime)
-        if not err then
+        local places, placesError = loadDestinations()
+        local saveError
+        if not places then
+            saveError = placesError
+        elseif not places[placeToDelete.id] then
+            saveError = "DESTINATION NO LONGER EXISTS"
+        else
+            places[placeToDelete.id] = nil
+            local _, err = saveDestinations(places)
+            saveError = err
+        end
+        notify(saveError or "PLACE DELETED", saveError and C.red or C.lime)
+        if not saveError then
             deleteMode = false
         end
         placeToDelete = nil
@@ -622,25 +703,30 @@ local function execute(id)
         notify("PLACE NOT DELETED", C.white)
 
     elseif id:match("^place_") then
-        local placeKey = id:sub(7)
-        local placeId = tonumber(placeKey) or placeKey
+        local placeName = id:sub(7)
         if deleteMode then
             placeToDelete = {
-                id = placeId,
-                name = placeKey
+                id = placeName,
+                name = placeName
             }
-            local places = call("getPlaces")
-            if type(places) == "table" then
-                local place = places[placeId] or places[placeKey]
-                if type(place) == "table" then
-                    placeToDelete.name = place.name or placeKey
-                end
-            end
             page = "confirm_delete"
-        elseif placeId ~= "" then
-            local _, err = call("goPlace", placeId)
-            notify(err or ("DESTINATION SELECTED: " .. placeId),
-                err and C.red or C.lime)
+        elseif placeName ~= "" then
+            local places, placesError = loadDestinations()
+            local place = places and places[placeName]
+            if not place then
+                notify(placesError or "DESTINATION NOT FOUND", C.red)
+            elseif runCommand(
+                "setCourse",
+                "COURSE PROGRAMMED",
+                place.x,
+                place.y,
+                place.z,
+                place.dimension,
+                true,
+                place.heading
+            ) then
+                runCommand("demat", "TRAVELING TO " .. placeName)
+            end
         else
             notify("INVALID DESTINATION ID", C.red)
         end
@@ -701,29 +787,13 @@ local function chatHandler()
                     end
                 end
             elseif command == "tardis go home" then
-                local places = call("getPlaces")
-                local savedPlace = {}
-                for id, place in pairs(places) do
-                    if type(place) == "table" and type(place.name) == "string" then
-                        if place.name == "Home" then
-                            savedPlace = {
-                                id = id,
-                                name = place.name,
-                                x = place.x,
-                                y = place.y,
-                                z = place.z,
-                                dimension = place.dimension,
-                                facing = place.facing
-                            }
-                        end
-                    end
-                end
-                if not savedPlace.name then
+                local places, placesError = loadDestinations()
+                local savedPlace = places and places.Home
+                if placesError then
+                    notify(placesError, C.red)
+                elseif not savedPlace then
                     notify("HOME DESTINATION NOT FOUND", C.red)
-                else
-                    notify("GOING HOME", C.lime)
-                end
-                if runCommand(
+                elseif runCommand(
                     "setCourse",
                     "GOING HOME : COURSE PROGRAMMED",
                     savedPlace.x,
@@ -731,7 +801,7 @@ local function chatHandler()
                     savedPlace.z,
                     savedPlace.dimension,
                     true,
-                    savedPlace.facing or 0
+                    savedPlace.heading
                 ) then
                     runCommand("demat", "GOING HOME : DEMATERIALIZATION")
                 end
