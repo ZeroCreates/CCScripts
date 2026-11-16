@@ -53,7 +53,14 @@ end
 local function receivedata()
     while true do
         local _, message = rednet.receive(REDNET_PROTOCOL, 2)
-        if message and message.energy then
+        if type(message) == "table"
+            and type(message.energy) == "number"
+            and type(message.cap) == "number"
+            and type(message.netenergy) == "number"
+            and type(message.netcap) == "number"
+            and type(message.plasmaTemp) == "number"
+            and type(message.DeuteriumAmt) == "number"
+            and type(message.TritiumAmt) == "number" then
             connected = true
             energy = message.energy
             cap = message.cap
@@ -62,11 +69,11 @@ local function receivedata()
             plasmaTemp = message.plasmaTemp
             DeuteriumAmt = message.DeuteriumAmt
             TritiumAmt = message.TritiumAmt
-            SleepMode = message.SleepMode
-            OverclockMode = message.OverclockMode
+            SleepMode = message.SleepMode == true
+            OverclockMode = message.OverclockMode == true
             percent = cap > 0 and energy / cap or 0
             npercent = ncap > 0 and nenergy / ncap or 0
-            AlertMode = message.AlertMode
+            AlertMode = message.AlertMode == true
         else
             connected = false
         end
