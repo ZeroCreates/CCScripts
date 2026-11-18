@@ -307,20 +307,21 @@ local function createAccount()
     if fs.exists(profilePath) then return false, "That user already exists." end
 
     print("")
-    print("A password is required for new accounts.")
+    print("Leave the password blank for passwordless sign-in.")
+    print("Anyone at the computer can access a passwordless profile.")
     print("Private data is obfuscated with a key stored on this computer.")
     write("Password: ")
     local password = read("*")
-    if type(password) ~= "string" or password == "" then
-        return false, "Password cannot be empty."
+    if type(password) ~= "string" then return false, "Could not read the password." end
+    if password ~= "" then
+        write("Confirm password: ")
+        if read("*") ~= password then return false, "Passwords did not match." end
     end
-    write("Confirm password: ")
-    if read("*") ~= password then return false, "Passwords did not match." end
 
     local created, createError = pcall(fs.makeDir, profilePath)
     if not created then return false, "Could not create user: " .. tostring(createError) end
     local passwords = copyMap(profilePasswords)
-    passwords[username] = password
+    passwords[username] = password ~= "" and password or nil
     local saved, saveError = saveJSON(PROFILE_PASSWORDS_PATH, passwords)
     if not saved then
         pcall(fs.delete, profilePath)
@@ -500,10 +501,12 @@ local function cycleIdleLock(direction)
         if minutes == (tonumber(settings.rift.idleLockMinutes) or 0) then current = index end
     end
     current = (current - 1 + direction) % #IDLE_CHOICES + 1
-    settings.rift.idleLockMinutes = IDLE_CHOICES[current]
-    if IDLE_CHOICES[current] > 0 and not profilePasswords[currentUser] then
+    if IDLE_CHOICES[current] > 0
+        and (not profilePasswords[currentUser] or profilePasswords[currentUser] == "") then
         message = "Idle lock needs a password on this account."
+        return
     end
+    settings.rift.idleLockMinutes = IDLE_CHOICES[current]
 end
 
 local function cycleTimeZone(direction)
@@ -527,28 +530,47 @@ local function changeOwnPassword()
     term.setCursorPos(1, 1)
     print("CHANGE PASSWORD FOR " .. currentUser)
     local existing = profilePasswords[currentUser]
-    if existing then
+    if existing and existing ~= "" then
         write("Current password: ")
         if read("*") ~= existing then
             message = "Incorrect current password."
             return
         end
     end
-    write("New password: ")
+    write("New password (leave blank to remove): ")
     local password = read("*")
-    if type(password) ~= "string" or password == "" then
-        message = "Password cannot be empty."
+    if type(password) ~= "string" then
+        message = "Could not read the password."
         return
     end
-    write("Confirm new password: ")
-    if read("*") ~= password then
-        message = "Passwords did not match."
-        return
+    if password ~= "" then
+        write("Confirm new password: ")
+        if read("*") ~= password then
+            message = "Passwords did not match."
+            return
+        end
     end
     local passwords = copyMap(profilePasswords)
-    passwords[currentUser] = password
+    passwords[currentUser] = password ~= "" and password or nil
     local saved, saveError = saveAccountData(passwords, profileAdmins)
-    message = saved and "Password changed." or tostring(saveError)
+    if not saved then
+        message = tostring(saveError)
+        return
+    end
+    if password == "" and (tonumber(settings.rift.idleLockMinutes) or 0) > 0 then
+        local previousIdleLock = settings.rift.idleLockMinutes
+        settings.rift.idleLockMinutes = 0
+        local preferencesSaved, preferencesError = saveJSON(SETTINGS_PATH, settings)
+        if not preferencesSaved then
+            settings.rift.idleLockMinutes = previousIdleLock
+            message = "Password removed, but idle lock could not be disabled: "
+                .. tostring(preferencesError)
+            return
+        end
+        message = "Password removed; idle lock disabled."
+    else
+        message = password == "" and "Password removed." or "Password changed."
+    end
 end
 
 local function editCustomColor(field, label)

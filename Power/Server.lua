@@ -1,10 +1,9 @@
 
 local REDNET_PROTOCOL = "zerofusion"
-local rednetModem = peripheral.find("modem")
-if not rednetModem then
-    error("No modem found for rednet")
-end
-rednet.open(peripheral.getName(rednetModem))
+local reassignArgument = (...)
+local reassign = type(reassignArgument) == "string"
+    and (reassignArgument:lower() == "reassign"
+        or reassignArgument:lower() == "--reassign")
 
 local discordHookPath = "/DiscordHook.lua"
 if not fs.exists(discordHookPath) then
@@ -34,16 +33,200 @@ if not success then
     error(discordHook)
 end
 
-local energyStorage = peripheral.wrap("back")
 local monitors = {peripheral.find("monitor")}
-local networkEnergyStorage = peripheral.wrap("ultimateEnergyCube_0")
 local reactor = peripheral.find("fusionReactorLogicAdapter")
-local deuteriumTank = peripheral.wrap("ultimateChemicalTank_0")
-local tritiumTank = peripheral.wrap("ultimateChemicalTank_1")
-if not energyStorage or not networkEnergyStorage or not reactor
-    or not deuteriumTank or not tritiumTank then
-    error("Required power, reactor, or chemical-tank peripheral not found.")
+if not reactor then error("Fusion reactor peripheral not found.") end
+
+local CONFIG_PATH = "/zerofusion-server.cfg"
+local config = {}
+if fs.exists(CONFIG_PATH) then
+    local file = fs.open(CONFIG_PATH, "r")
+    if file then
+        local contents = file.readAll()
+        file.close()
+        local ok, savedConfig = pcall(textutils.unserialize, contents)
+        if ok and type(savedConfig) == "table" then
+            config = savedConfig
+        else
+            print("Peripheral configuration is invalid; it will be recreated.")
+        end
+    end
 end
+
+local function peripheralTypes(name)
+    local values = {peripheral.getType(name)}
+    local result = {}
+    for _, value in ipairs(values) do
+        if type(value) == "string" then
+            table.insert(result, value:lower())
+        end
+    end
+    return table.concat(result, " ")
+end
+
+local function isChemicalTank(name)
+    local types = peripheralTypes(name)
+    local wrapped = peripheral.wrap(name)
+    return types:find("chemical", 1, true) ~= nil
+        and types:find("tank", 1, true) ~= nil
+        and wrapped and type(wrapped.getStored) == "function"
+end
+
+local function isEnergyStorage(name)
+    local wrapped = peripheral.wrap(name)
+    return wrapped and type(wrapped.getEnergy) == "function"
+        and type(wrapped.getMaxEnergy) == "function"
+end
+
+local function isModem(name)
+    return peripheralTypes(name):find("modem", 1, true) ~= nil
+end
+
+local chemicalTanks, energyStorages, modems = {}, {}, {}
+for _, name in ipairs(peripheral.getNames()) do
+    if isChemicalTank(name) then table.insert(chemicalTanks, name) end
+    if isEnergyStorage(name) then table.insert(energyStorages, name) end
+    if isModem(name) then table.insert(modems, name) end
+end
+table.sort(chemicalTanks)
+table.sort(energyStorages)
+table.sort(modems)
+
+local function getChemicalIdentifier(name)
+    local tank = peripheral.wrap(name)
+    local ok, stored = pcall(tank.getStored)
+    if not ok or type(stored) ~= "table" then return "" end
+
+    local identifiers = {}
+    for _, field in ipairs({"name", "id", "chemical", "chemicalName", "registryName", "type"}) do
+        local value = stored[field]
+        if type(value) == "string" then
+            table.insert(identifiers, value:lower())
+        elseif type(value) == "table" then
+            for _, nestedField in ipairs({"name", "id", "registryName"}) do
+                if type(value[nestedField]) == "string" then
+                    table.insert(identifiers, value[nestedField]:lower())
+                end
+            end
+        end
+    end
+    return table.concat(identifiers, " ")
+end
+
+local function findChemicalTank(keyword)
+    local matches = {}
+    for _, name in ipairs(chemicalTanks) do
+        if getChemicalIdentifier(name):find(keyword, 1, true) then
+            table.insert(matches, name)
+        end
+    end
+    if #matches == 1 then return matches[1] end
+    return nil
+end
+
+local function choosePeripheral(label, candidates, suggested)
+    if #candidates == 0 then error("No peripherals available for " .. label .. ".") end
+    print(label .. " peripherals:")
+    for index, name in ipairs(candidates) do
+        print(string.format("  %d) %s%s", index, name,
+            name == suggested and " [detected/current]" or ""))
+    end
+    while true do
+        write(label .. " [number/name" .. (suggested and ", Enter=" .. suggested or "") .. "]: ")
+        local choice = read()
+        if choice == "" and suggested then return suggested end
+        local index = tonumber(choice)
+        if index and candidates[index] then return candidates[index] end
+        for _, name in ipairs(candidates) do
+            if choice == name then return name end
+        end
+        print("Choose a listed peripheral.")
+    end
+end
+
+local function isCandidate(name, candidates)
+    for _, candidate in ipairs(candidates) do
+        if name == candidate then return true end
+    end
+    return false
+end
+
+local autoDeuterium = findChemicalTank("deuterium")
+local autoTritium = findChemicalTank("tritium")
+local deuteriumDefault = autoDeuterium or config.deuteriumTank
+local tritiumDefault = autoTritium or config.tritiumTank
+if not isCandidate(deuteriumDefault, chemicalTanks) then deuteriumDefault = nil end
+if not isCandidate(tritiumDefault, chemicalTanks) then tritiumDefault = nil end
+
+local energyDefault = isCandidate(config.energyStorage, energyStorages)
+    and config.energyStorage or nil
+local networkDefault = isCandidate(config.networkEnergyStorage, energyStorages)
+    and config.networkEnergyStorage or nil
+local modemDefault = isCandidate(config.modem, modems) and config.modem or nil
+
+local deuteriumTankName, tritiumTankName
+if reassign or not deuteriumDefault then
+    deuteriumTankName = choosePeripheral("Deuterium tank", chemicalTanks, deuteriumDefault)
+else
+    deuteriumTankName = deuteriumDefault
+end
+if reassign or not tritiumDefault or tritiumDefault == deuteriumTankName then
+    local remainingTanks = {}
+    for _, name in ipairs(chemicalTanks) do
+        if name ~= deuteriumTankName then table.insert(remainingTanks, name) end
+    end
+    tritiumTankName = choosePeripheral("Tritium tank", remainingTanks, tritiumDefault)
+else
+    tritiumTankName = tritiumDefault
+end
+
+local energyStorageName, networkEnergyStorageName
+if reassign or not energyDefault or energyDefault == networkDefault then
+    energyStorageName = choosePeripheral("Energy storage", energyStorages, energyDefault)
+else
+    energyStorageName = energyDefault
+end
+if reassign or not networkDefault or networkDefault == energyStorageName then
+    local remainingStorages = {}
+    for _, name in ipairs(energyStorages) do
+        if name ~= energyStorageName then table.insert(remainingStorages, name) end
+    end
+    networkEnergyStorageName = choosePeripheral(
+        "Network storage", remainingStorages, networkDefault
+    )
+else
+    networkEnergyStorageName = networkDefault
+end
+
+local modemName
+if reassign or not modemDefault then
+    modemName = choosePeripheral("Rednet modem", modems, modemDefault)
+else
+    modemName = modemDefault
+end
+
+config.deuteriumTank = deuteriumTankName
+config.tritiumTank = tritiumTankName
+config.energyStorage = energyStorageName
+config.networkEnergyStorage = networkEnergyStorageName
+config.modem = modemName
+local configFile = fs.open(CONFIG_PATH, "w")
+if not configFile then error("Could not save peripheral configuration.") end
+configFile.write(textutils.serialize(config))
+configFile.close()
+
+local rednetModem = peripheral.wrap(modemName)
+if not rednetModem then error("Could not open the selected modem: " .. modemName) end
+rednet.open(modemName)
+
+local deuteriumTank = peripheral.wrap(deuteriumTankName)
+local tritiumTank = peripheral.wrap(tritiumTankName)
+local energyStorage = peripheral.wrap(energyStorageName)
+local networkEnergyStorage = peripheral.wrap(networkEnergyStorageName)
+print("Rednet modem: " .. modemName)
+print("Deuterium: " .. deuteriumTankName .. " | Tritium: " .. tritiumTankName)
+print("Energy storage: " .. energyStorageName
+    .. " | Network storage: " .. networkEnergyStorageName)
 
 local energy = 10000000000
 local cap = 10000000000

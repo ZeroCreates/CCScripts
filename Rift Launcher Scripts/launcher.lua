@@ -14,6 +14,19 @@ local nativeRequire = require
 local nativePullEvent = nativeOs.pullEvent
 local nativePullEventRaw = nativeOs.pullEventRaw
 
+local function openWirelessRednetModems()
+    if type(peripheral) ~= "table" or type(rednet) ~= "table" then return end
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            local modem = peripheral.wrap(name)
+            if modem and type(modem.isWireless) == "function" and modem.isWireless()
+                and not rednet.isOpen(name) then
+                rednet.open(name)
+            end
+        end
+    end
+end
+
 -- Black box recorder: every entry is appended and closed at once, so it survives crashes and reboots.
 local BOOT_LOG_PATH = "/.launcher/system/boot.log"
 local BOOT_LOG_OLD_PATH = BOOT_LOG_PATH .. ".old"
@@ -235,6 +248,7 @@ local services = {
                 notifyUser("Disk removed (" .. tostring(event[2]) .. ").")
             elseif event[1] == "peripheral" or event[1] == "peripheral_detach" then
                 bootLog("PERIPHERAL " .. event[1] .. " " .. tostring(event[2]))
+                if event[1] == "peripheral" then openWirelessRednetModems() end
             elseif event[1] == "monitor_resize" or event[1] == "term_resize" then
                 bootLog("DISPLAY " .. event[1])
             end
@@ -1635,7 +1649,7 @@ local function chooseUserPrompt(skipAutoLogin)
 
     local function authenticate(username)
         local expected = profilePasswords[username]
-        if not expected then return true end
+        if not expected or expected == "" then return true end
         term.setBackgroundColor(colors.black)
         term.setTextColor(colors.white)
         term.clear()
@@ -1659,7 +1673,8 @@ local function chooseUserPrompt(skipAutoLogin)
         print("CREATE YOUR ADMIN ACCOUNT")
         term.setTextColor(colors.white)
         print("This is the first account on this computer.")
-        print("A password is required.")
+        print("Leave the password blank for passwordless sign-in.")
+        print("Anyone at the computer can access a passwordless profile.")
         print("Private data is obfuscated with a key stored on this computer.")
         if profileMessage ~= "" then
             term.setTextColor(colors.yellow)
@@ -1681,14 +1696,12 @@ local function chooseUserPrompt(skipAutoLogin)
         end
         write("Password: ")
         local password = readPassword()
-        if password == "" then
-            profileMessage = "Password cannot be empty."
-            return false
-        end
-        write("Confirm password: ")
-        if readPassword() ~= password then
-            profileMessage = "Passwords did not match."
-            return false
+        if password ~= "" then
+            write("Confirm password: ")
+            if readPassword() ~= password then
+                profileMessage = "Passwords did not match."
+                return false
+            end
         end
 
         local created, createError = pcall(fs.makeDir, path)
@@ -1696,7 +1709,7 @@ local function chooseUserPrompt(skipAutoLogin)
             profileMessage = "Could not create profile: " .. tostring(createError)
             return false
         end
-        profilePasswords[username] = password
+        profilePasswords[username] = password ~= "" and password or nil
         local saved, saveError = saveProfilePasswords(profilePasswords)
         if not saved then
             profilePasswords[username] = nil
@@ -1785,7 +1798,7 @@ local function chooseUserPrompt(skipAutoLogin)
         end
         term.setCursorPos(2, height - 2)
         term.setTextColor(colors.yellow)
-        term.write(("Launcher sandbox is best-effort; cross-profile access needs a password."):sub(1, math.max(0, width - 2)))
+        term.write(("Launcher sandbox is best-effort; cross-profile access needs a password or admin authorization."):sub(1, math.max(0, width - 2)))
 
         local buttons = {}
         if currentUser then
@@ -1861,9 +1874,7 @@ local function authorizeProfileAccess(username, profileContext)
     if not fs.isDir(profilePath) then return false, "That profile does not exist." end
 
     local expected = passwords[username]
-    if type(expected) ~= "string" or expected == "" then
-        return false, "This profile has no password. Set one before accessing it."
-    end
+    local hasPassword = type(expected) == "string" and expected ~= ""
 
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
@@ -1872,10 +1883,14 @@ local function authorizeProfileAccess(username, profileContext)
     term.setTextColor(colors.cyan)
     print("PROFILE ACCESS REQUIRED")
     term.setTextColor(colors.white)
-    print("Enter " .. username .. "'s password, or type sudo as an admin.")
+    if hasPassword then
+        print("Enter " .. username .. "'s password, or type sudo as an admin.")
+    else
+        print("This profile has no password. Type sudo as an admin to continue.")
+    end
     write("Password: ")
     local entered = readPassword()
-    if entered == expected then
+    if hasPassword and entered == expected then
         authorized[username] = true
         return true
     elseif entered == "sudo" and admins[accessingUser] == true then
@@ -4092,7 +4107,7 @@ local inputEvents = {
 
 lockScreen = function()
     local expected = currentUser and profilePasswords[currentUser]
-    if not expected or screenLocked then return false end
+    if not expected or expected == "" or screenLocked then return false end
     screenLocked = true
     bootLog("LOCK screen engaged for " .. tostring(currentUser))
     local screen = term.native()
@@ -4779,7 +4794,8 @@ showRecoveryProfileInspector = function()
         for index = first, last do
             local name = profiles[index]
             local role = profileAdmins[name] and "ADMIN" or "STANDARD"
-            local password = profilePasswords[name] and "PASSWORD SET" or "NO PASSWORD"
+            local password = profilePasswords[name] and profilePasswords[name] ~= ""
+                and "PASSWORD SET" or "NO PASSWORD"
             local row = index - first + 4
             term.setCursorPos(2, row)
             if index == selectedProfile then
@@ -4825,26 +4841,25 @@ showRecoveryProfileInspector = function()
         term.clear()
         term.setCursorPos(1, 1)
         print("RESET PASSWORD FOR " .. username)
-        write("New password: ")
+        write("New password (leave blank to remove): ")
         local password = readPassword()
-        if password == "" then
-            status = "Password cannot be empty."
-            return
-        end
-        write("Confirm password: ")
-        if readPassword() ~= password then
-            status = "Passwords did not match."
-            return
+        if password ~= "" then
+            write("Confirm password: ")
+            if readPassword() ~= password then
+                status = "Passwords did not match."
+                return
+            end
         end
         local passwords = copyMap(profilePasswords)
-        passwords[username] = password
+        passwords[username] = password ~= "" and password or nil
         local ok, saved, saveError = pcall(saveProfilePasswords, passwords)
         if not ok or not saved then
             status = "Could not save the new password: " .. tostring(ok and saveError or saved)
             return
         end
         profilePasswords = passwords
-        status = "Password reset for " .. username .. "."
+        status = password == "" and "Password removed for " .. username .. "."
+            or "Password reset for " .. username .. "."
     end
 
     local function toggleRole(username)
@@ -5133,6 +5148,7 @@ local function wipeRecoveryComputer()
 end
 
 local function launcherMain()
+openWirelessRednetModems()
 bootFlow.handleRecovery()
 local startupError = bootFlow.loadSettings()
 local downloaderReady, downloaderError = bootFlow.prepareLauncherUpdate()

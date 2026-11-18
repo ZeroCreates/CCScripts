@@ -996,6 +996,7 @@ local function commandPrompt()
     local commandRoot = recoveryMode and "/" or homeDirectory
     local workingDirectory = recoveryMode and currentDirectory
         or isWithinRoot(currentDirectory, homeDirectory) and currentDirectory or homeDirectory
+    local previousDirectory
     local history = {}
     local width = term.getSize()
     local function writePromptLine(text, foreground)
@@ -1003,10 +1004,13 @@ local function commandPrompt()
         print(tostring(text):sub(1, width))
     end
     local function showPromptHelp()
-        writePromptLine("Commands: cd, ls, pwd, mkdir, rm, cp, mv, wget, upload")
-        writePromptLine("Aliases: dir, md, del, delete, copy, move, edit")
-        writePromptLine("upload <file.lua> shares a Lua file. Quote paths with spaces.")
-        writePromptLine("Lua paths, clear/cls, help, exit.")
+        writePromptLine("Navigation: cd, ls/dir, pwd")
+        writePromptLine("Files: mkdir/md, touch, rm/del/delete, cp/copy, mv/move/rename")
+        writePromptLine("Text/search: cat, echo, grep, find, tree")
+        writePromptLine("Info: stat, which")
+        writePromptLine("Programs/files: edit, wget, upload")
+        writePromptLine("Shell: history, clear/cls, help, exit/quit")
+        writePromptLine("Quote paths with spaces. upload <file.lua> shares a Lua file.")
     end
     local function drawPromptHeader()
         term.setBackgroundColor(colors.black)
@@ -1209,8 +1213,9 @@ local function commandPrompt()
             local commandQuote = rawPrefix:match("^([\"'])")
             local commandPrefix = commandQuote and rawPrefix:sub(2) or rawPrefix
             for _, candidate in ipairs({ "cd", "dir", "ls", "pwd", "mkdir", "md",
-                "rm", "del", "delete", "cp", "copy", "mv", "move", "wget", "upload", "edit",
-                "cls", "clear", "help", "exit" }) do
+                "rm", "del", "delete", "cp", "copy", "mv", "move", "rename", "wget",
+                "upload", "edit", "cat", "echo", "touch", "stat", "which", "history",
+                "tree", "find", "grep", "cls", "clear", "help", "exit", "quit" }) do
                 if not commandQuote
                     and candidate:sub(1, #rawPrefix):lower() == rawPrefix:lower() then
                     table.insert(candidates, candidate:sub(#rawPrefix + 1))
@@ -1252,10 +1257,13 @@ local function commandPrompt()
                 or commandName == "dir"
                 or commandName == "rm" or commandName == "del" or commandName == "delete"
                 or commandName == "cp" or commandName == "copy"
-                or commandName == "mv" or commandName == "move" or commandName == "edit"
+                or commandName == "mv" or commandName == "move" or commandName == "rename"
+                or commandName == "cat" or commandName == "touch" or commandName == "stat"
+                or commandName == "grep" or commandName == "find" or commandName == "tree"
+                or commandName == "edit"
                 or commandName == "wget" or commandName == "upload"
             local supportsTwoPaths = commandName == "cp" or commandName == "copy"
-                or commandName == "mv" or commandName == "move"
+                or commandName == "mv" or commandName == "move" or commandName == "rename"
             local needsPath = supportsTwoPaths and #previousArguments <= 2
                 or commandName == "wget" and #previousArguments == 2
                 or not supportsTwoPaths and commandName ~= "wget" and #previousArguments == 1
@@ -1325,18 +1333,48 @@ local function commandPrompt()
             elseif command == "pwd" then
                 writePromptLine(location)
             elseif command == "cd" then
-                local destination = resolveHomePath(workingDirectory, arguments[2] or "/")
+                local destinationInput = arguments[2] or "/"
+                if destinationInput == "~" then
+                    destinationInput = "/"
+                elseif destinationInput == "-" then
+                    destinationInput = previousDirectory
+                end
+                local destination = destinationInput
+                    and resolveHomePath(workingDirectory, destinationInput)
                 if not destination or not fs.isDir(destination) then
                     writePromptLine(recoveryMode and "Directory not found or unavailable."
                         or "Directory not found in your home directory.", colors.red)
                 else
+                    previousDirectory = workingDirectory
                     workingDirectory = destination
+                    if arguments[2] == "-" then
+                        writePromptLine(displayPath(workingDirectory))
+                    end
                 end
             elseif command == "ls" or command == "dir" then
-                local directory = resolveHomePath(workingDirectory, arguments[2] or ".")
+                local showHidden = false
+                local longListing = false
+                local directoryInput = "."
+                for index = 2, #arguments do
+                    if arguments[index] == "-a" then
+                        showHidden = true
+                    elseif arguments[index] == "-l" then
+                        longListing = true
+                    elseif arguments[index]:sub(1, 1) == "-" then
+                        writePromptLine("Unknown ls option: " .. arguments[index], colors.red)
+                        directoryInput = nil
+                        break
+                    else
+                        directoryInput = arguments[index]
+                    end
+                end
+                local directory = directoryInput
+                    and resolveHomePath(workingDirectory, directoryInput)
                 if not directory or not fs.isDir(directory) then
-                    writePromptLine(recoveryMode and "Directory not found or unavailable."
-                        or "Directory not found in your home directory.", colors.red)
+                    if directoryInput then
+                        writePromptLine(recoveryMode and "Directory not found or unavailable."
+                            or "Directory not found in your home directory.", colors.red)
+                    end
                 else
                     local names = fs.list(directory)
                     table.sort(names, function(first, second)
@@ -1344,15 +1382,247 @@ local function commandPrompt()
                     end)
                     local shown = 0
                     for _, name in ipairs(names) do
-                        if altHeld or name:sub(1, 1) ~= "." then
+                        if showHidden or altHeld or name:sub(1, 1) ~= "." then
                             local path = fs.combine(directory, name)
                             if not isRecoveryProtectedPath(path) then
-                                writePromptLine(name .. (fs.isDir(path) and "/" or ""))
+                                if longListing then
+                                    local attributesOk, attributes = pcall(fs.attributes, path)
+                                    if not attributesOk then attributes = nil end
+                                    local size = type(attributes) == "table" and attributes.size or nil
+                                    local suffix = fs.isDir(path) and "/" or ""
+                                    writePromptLine((fs.isDir(path) and "d " or "- ")
+                                        .. (size and tostring(size) .. " " or "")
+                                        .. name .. suffix)
+                                else
+                                    writePromptLine(name .. (fs.isDir(path) and "/" or ""))
+                                end
                                 shown = shown + 1
                             end
                         end
                     end
                     if shown == 0 then writePromptLine("Directory is empty.", colors.lightGray) end
+                end
+            elseif command == "cat" then
+                if not arguments[2] then
+                    writePromptLine("Usage: cat <file>", colors.red)
+                else
+                    local path = resolveHomePath(workingDirectory, arguments[2])
+                    if not path or not fs.exists(path) or fs.isDir(path)
+                        or isRecoveryProtectedPath(path) or containsRecoveryProtectedPath(path) then
+                        writePromptLine("File not found or unavailable.", colors.red)
+                    else
+                        local file = fs.open(path, "r")
+                        if not file then
+                            writePromptLine("Could not open " .. displayPath(path) .. ".", colors.red)
+                        else
+                            local contents = file.readAll()
+                            file.close()
+                            if contents == "" then
+                                writePromptLine("")
+                            else
+                                for line in (contents .. "\n"):gmatch("(.-)\n") do
+                                    writePromptLine(line)
+                                end
+                            end
+                        end
+                    end
+                end
+            elseif command == "echo" then
+                local text = table.concat(arguments, " ", 2)
+                writePromptLine(text)
+            elseif command == "touch" then
+                if not arguments[2] then
+                    writePromptLine("Usage: touch <file>", colors.red)
+                else
+                    local path = resolveHomePath(workingDirectory, arguments[2])
+                    if not path or path == commandRoot or isRecoveryProtectedPath(path)
+                        or containsRecoveryProtectedPath(path) then
+                        writePromptLine("Choose an available file inside the command scope.", colors.red)
+                    elseif fs.isDir(path) then
+                        writePromptLine("That path is a directory.", colors.red)
+                    elseif fs.exists(path) then
+                        writePromptLine("File already exists.", colors.lightGray)
+                    else
+                        local parent = fs.getDir(path)
+                        if not fs.isDir(parent) then
+                            writePromptLine("Parent directory does not exist.", colors.red)
+                        else
+                            local file = fs.open(path, "w")
+                            if not file then
+                                writePromptLine("Could not create " .. displayPath(path) .. ".", colors.red)
+                            else
+                                file.close()
+                                writePromptLine("Created " .. displayPath(path) .. ".", colors.lime)
+                            end
+                        end
+                    end
+                end
+            elseif command == "stat" then
+                if not arguments[2] then
+                    writePromptLine("Usage: stat <path>", colors.red)
+                else
+                    local path = resolveHomePath(workingDirectory, arguments[2])
+                    if not path or not fs.exists(path) or isRecoveryProtectedPath(path)
+                        or containsRecoveryProtectedPath(path) then
+                        writePromptLine("Path not found or unavailable.", colors.red)
+                    else
+                        local attributesOk, attributes = pcall(fs.attributes, path)
+                        local isDirectory = fs.isDir(path)
+                        writePromptLine("Path: " .. displayPath(path))
+                        writePromptLine("Type: " .. (isDirectory and "directory" or "file"))
+                        if attributesOk and type(attributes) == "table" then
+                            if not isDirectory and type(attributes.size) == "number" then
+                                writePromptLine("Size: " .. tostring(attributes.size) .. " bytes")
+                            end
+                            if type(attributes.modified) == "number" then
+                                local modifiedOk, modified = pcall(os.date, "%Y-%m-%d %H:%M:%S",
+                                    attributes.modified)
+                                if modifiedOk then writePromptLine("Modified: " .. tostring(modified)) end
+                            end
+                        end
+                    end
+                end
+            elseif command == "which" then
+                if not arguments[2] then
+                    writePromptLine("Usage: which <program>", colors.red)
+                else
+                    local builtIns = {
+                        cd = true, dir = true, ls = true, pwd = true, mkdir = true, md = true,
+                        rm = true, del = true, delete = true, cp = true, copy = true,
+                        mv = true, move = true, rename = true, wget = true, upload = true,
+                        edit = true, cat = true, echo = true, touch = true, stat = true,
+                        which = true, history = true, tree = true, find = true, grep = true,
+                        cls = true, clear = true, help = true, exit = true, quit = true
+                    }
+                    if builtIns[arguments[2]:lower()] then
+                        writePromptLine(arguments[2]:lower() .. ": built-in")
+                    else
+                        local programPath = resolveProgram(arguments[2])
+                        writePromptLine(programPath and displayPath(programPath)
+                            or "Program not found.", programPath and colors.lime or colors.red)
+                    end
+                end
+            elseif command == "history" then
+                for index, entry in ipairs(history) do
+                    writePromptLine(string.format("%4d  %s", index, entry))
+                end
+                if #history == 0 then writePromptLine("History is empty.", colors.lightGray) end
+            elseif command == "tree" then
+                local directoryInput = arguments[2] or "."
+                local directory = resolveHomePath(workingDirectory, directoryInput)
+                if not directory or not fs.isDir(directory) then
+                    writePromptLine("Directory not found or unavailable.", colors.red)
+                else
+                    writePromptLine(displayPath(directory))
+                    local function printTree(path, indent)
+                        local names = fs.list(path)
+                        table.sort(names, function(first, second)
+                            return first:lower() < second:lower()
+                        end)
+                        for _, name in ipairs(names) do
+                            if (altHeld or name:sub(1, 1) ~= ".") then
+                                local child = fs.combine(path, name)
+                                if not isRecoveryProtectedPath(child) then
+                                    writePromptLine(indent .. name .. (fs.isDir(child) and "/" or ""))
+                                    if fs.isDir(child) then
+                                        printTree(child, indent .. "  ")
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    printTree(directory, "  ")
+                end
+            elseif command == "find" then
+                local directoryInput = "."
+                local pattern
+                if arguments[2] then
+                    local possibleDirectory = resolveHomePath(workingDirectory, arguments[2])
+                    if possibleDirectory and fs.isDir(possibleDirectory) then
+                        directoryInput = arguments[2]
+                        pattern = arguments[3]
+                    else
+                        pattern = arguments[2]
+                    end
+                end
+                local directory = resolveHomePath(workingDirectory, directoryInput)
+                if not directory or not fs.isDir(directory) then
+                    writePromptLine("Directory not found or unavailable.", colors.red)
+                else
+                    local patternLower = pattern and pattern:lower() or nil
+                    local function findIn(path)
+                        for _, name in ipairs(fs.list(path)) do
+                            if altHeld or name:sub(1, 1) ~= "." then
+                                local child = fs.combine(path, name)
+                                if not isRecoveryProtectedPath(child)
+                                    and (not patternLower
+                                        or name:lower():find(patternLower, 1, true)) then
+                                    writePromptLine(displayPath(child))
+                                end
+                                if fs.isDir(child) then findIn(child) end
+                            end
+                        end
+                    end
+                    findIn(directory)
+                end
+            elseif command == "grep" then
+                if not arguments[2] then
+                    writePromptLine("Usage: grep <text> [file]", colors.red)
+                else
+                    local needle = arguments[2]:lower()
+                    if arguments[3] then
+                        local path = resolveHomePath(workingDirectory, arguments[3])
+                        if not path or not fs.exists(path) or fs.isDir(path)
+                            or isRecoveryProtectedPath(path) then
+                            writePromptLine("File not found or unavailable.", colors.red)
+                        else
+                            local file = fs.open(path, "r")
+                            if not file then
+                                writePromptLine("Could not open " .. displayPath(path) .. ".", colors.red)
+                            else
+                                local lineNumber = 0
+                                while true do
+                                    local line = file.readLine()
+                                    if line == nil then break end
+                                    lineNumber = lineNumber + 1
+                                    if line:lower():find(needle, 1, true) then
+                                        writePromptLine(displayPath(path) .. ":" .. tostring(lineNumber)
+                                            .. ":" .. line)
+                                    end
+                                end
+                                file.close()
+                            end
+                        end
+                    else
+                        local function grepIn(path)
+                            for _, name in ipairs(fs.list(path)) do
+                                if altHeld or name:sub(1, 1) ~= "." then
+                                    local child = fs.combine(path, name)
+                                    if not isRecoveryProtectedPath(child) then
+                                        if fs.isDir(child) then
+                                            grepIn(child)
+                                        else
+                                            local file = fs.open(child, "r")
+                                            if file then
+                                                local lineNumber = 0
+                                                while true do
+                                                    local line = file.readLine()
+                                                    if line == nil then break end
+                                                    lineNumber = lineNumber + 1
+                                                    if line:lower():find(needle, 1, true) then
+                                                        writePromptLine(displayPath(child) .. ":"
+                                                            .. tostring(lineNumber) .. ":" .. line)
+                                                    end
+                                                end
+                                                file.close()
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                        grepIn(workingDirectory)
+                    end
                 end
             elseif command == "mkdir" or command == "md" then
                 if not arguments[2] then
@@ -1389,7 +1659,7 @@ local function commandPrompt()
                     end
                 end
             elseif command == "cp" or command == "copy"
-                or command == "mv" or command == "move" then
+                or command == "mv" or command == "move" or command == "rename" then
                 if not arguments[2] or not arguments[3] then
                     writePromptLine("Usage: " .. command .. " <source> <destination>", colors.red)
                 else
