@@ -2404,25 +2404,78 @@ local function runHomeProgram(programPath, profileContext, ...)
         end
         for _, name in ipairs(peripheral.getNames()) do
             local typeOk, peripheralType = pcall(peripheral.getType, name)
-            if typeOk and peripheralType == "drive" then driveNames[#driveNames + 1] = name end
+            local mountKind
+            local function hasType(expected)
+                if peripheralType == expected then return true end
+                if type(peripheralType) == "table" then
+                    for _, attachedType in ipairs(peripheralType) do
+                        if attachedType == expected then return true end
+                    end
+                end
+                return false
+            end
+            if typeOk and hasType("hard_drive") then
+                mountKind = "hard_drive"
+            elseif typeOk and hasType("drive") then
+                mountKind = "disk"
+            end
+            if mountKind then
+                driveNames[#driveNames + 1] = { name = name, kind = mountKind }
+            end
         end
-        if #driveNames == 0
-            or not riftModules.check("peripheral:drive", "your drive", riftModules.appName()) then
-            return mounts
+        if #driveNames == 0 then return mounts end
+
+        local access = {}
+        for _, drive in ipairs(driveNames) do
+            if access[drive.kind] == nil then
+                local permissionType = drive.kind == "hard_drive" and "hard_drive" or "drive"
+                local permissionLabel = drive.kind == "hard_drive" and "hard drive" or "drive"
+                access[drive.kind] = riftModules.check(
+                    "peripheral:" .. permissionType,
+                    "your " .. permissionLabel,
+                    riftModules.appName()
+                )
+            end
         end
-        for _, name in ipairs(driveNames) do
-                local wrapOk, drive = pcall(peripheral.wrap, name)
+        local hasAccess = false
+        for _, granted in pairs(access) do
+            if granted then
+                hasAccess = true
+                break
+            end
+        end
+        if not hasAccess then return mounts, "Drive access was denied." end
+
+        local mounted = {}
+        for _, attachedDrive in ipairs(driveNames) do
+            if access[attachedDrive.kind] then
+                local wrapOk, drive = pcall(peripheral.wrap, attachedDrive.name)
                 if wrapOk and drive and type(drive.getMountPath) == "function" then
                     local mountOk, mountPath = pcall(drive.getMountPath)
                     if mountOk and type(mountPath) == "string" then
                         mountPath = mountPath:gsub("^/+", ""):gsub("/+$", "")
                         if mountPath:match("^[%w_%-]+$") then
-                            mounts[#mounts + 1] = mountPath
+                            mounted[mountPath] = {
+                                path = mountPath,
+                                kind = attachedDrive.kind,
+                                peripheral = attachedDrive.name,
+                            }
                         end
                     end
                 end
+            end
         end
-        table.sort(mounts, function(first, second) return first:lower() < second:lower() end)
+        for _, mount in pairs(mounted) do
+            mounts[#mounts + 1] = mount
+        end
+        table.sort(mounts, function(first, second)
+            return first.path:lower() < second.path:lower()
+        end)
+        local aliases, counts = { hard_drive = "HD", disk = "D" }, { hard_drive = 0, disk = 0 }
+        for _, mount in ipairs(mounts) do
+            counts[mount.kind] = counts[mount.kind] + 1
+            mount.alias = aliases[mount.kind] .. counts[mount.kind] .. "://"
+        end
         return mounts
     end
 
@@ -2482,7 +2535,7 @@ local function runHomeProgram(programPath, profileContext, ...)
             local directory = locationDirectories[location:lower()]
             return directory and ("/" .. directory) or ("%" .. location .. "%")
         end)
-        local alias, aliasPath = path:match("^([%w@#]+://)(.*)$")
+        local alias, aliasPath = path:match("^([%w@#?]+://)(.*)$")
         if alias then return alias .. normalizeSegments(aliasPath) end
         local initialDirectory = path:sub(1, 1) ~= "/" and virtualDirectory or ""
         return normalizeSegments(path, initialDirectory)
@@ -2490,7 +2543,7 @@ local function runHomeProgram(programPath, profileContext, ...)
 
     local function physicalPath(path)
         local normalizedPath = normalizeVirtualPath(path)
-        local alias, aliasPath = normalizedPath:match("^([%w@#]+://)(.*)$")
+        local alias, aliasPath = normalizedPath:match("^([%w@#?]+://)(.*)$")
         if alias == "H://" then
             return nativeFs.combine(homeDirectory, aliasPath)
         elseif alias == "ROOT://" then
@@ -2508,12 +2561,13 @@ local function runHomeProgram(programPath, profileContext, ...)
             if otherUsername then
                 return resolveProfilePath(otherUsername, aliasPath)
             end
-            local driveNumber = tonumber(alias:match("^D(%d+)://$"))
-            if driveNumber then
-                local mounts = getDriveMounts()
-                local mountPath = mounts[driveNumber]
-                if not mountPath then return nil end
-                return nativeFs.combine("/", mountPath, aliasPath)
+            if alias:match("^D%d+://$") or alias:match("^HD%d+://$")
+                or alias:match("^%?%?%d+://$") then
+                for _, mount in ipairs(getDriveMounts()) do
+                    if mount.alias == alias then
+                        return nativeFs.combine("/", mount.path, aliasPath)
+                    end
+                end
             end
             return nil
         end
@@ -2539,7 +2593,7 @@ local function runHomeProgram(programPath, profileContext, ...)
 
     local function virtualAbsolute(path)
         local normalized = normalizeVirtualPath(path)
-        if normalized:match("^[%w@#]+://") then return normalized end
+        if normalized:match("^[%w@#?]+://") then return normalized end
         return normalized == "" and "/" or "/" .. normalized
     end
 
@@ -2744,6 +2798,21 @@ local function runHomeProgram(programPath, profileContext, ...)
         end
 
         local sandboxFs = {}
+        sandboxFs.chooseSaveLocation = function()
+            local mounts, mountError = getDriveMounts()
+            if mountError then return nil, mountError end
+            if #mounts == 0 then return "H://" end
+
+            local options = { "Home directory (H://)" }
+            for _, mount in ipairs(mounts) do
+                local label = mount.kind == "hard_drive" and "Hard drive" or "Disk"
+                options[#options + 1] = label .. " (" .. mount.alias .. ")"
+            end
+            local choice = riftModules.ui().menu("Choose save location", options)
+            if not choice then return nil end
+            if choice == 1 then return "H://" end
+            return mounts[choice - 1].alias
+        end
         sandboxFs.combine = function(...)
             local parts = { ... }
             local joined = ""
@@ -2770,7 +2839,7 @@ local function runHomeProgram(programPath, profileContext, ...)
         sandboxFs.getDir = function(path)
             if isRecoveryProtectedPath(path) then error("This path is unavailable in recovery mode.", 0) end
             local normalized = normalizeVirtualPath(path)
-            local alias, aliasPath = normalized:match("^([%w@#]+://)(.*)$")
+            local alias, aliasPath = normalized:match("^([%w@#?]+://)(.*)$")
             local target = physicalPath(path)
             if not target then return nil end
             if alias then return alias .. nativeFs.getDir(aliasPath) end
@@ -2838,7 +2907,7 @@ local function runHomeProgram(programPath, profileContext, ...)
                 local results = {}
                 local physicalHome = nativeFs.combine(homeDirectory, "")
                 local normalizedPattern = normalizeVirtualPath(pattern)
-                local alias = normalizedPattern:match("^([%w@#]+://)")
+                local alias = normalizedPattern:match("^([%w@#?]+://)")
                 if alias then
                     local base = physicalPath(alias)
                     local target = physicalPath(pattern)
@@ -2890,7 +2959,7 @@ local function runHomeProgram(programPath, profileContext, ...)
         if type(nativeFs.complete) == "function" then
             sandboxFs.complete = function(path, location, includeFiles, includeDirs)
                 local normalized = normalizeVirtualPath(path)
-                local alias, aliasPath = normalized:match("^([%w@#]+://)(.*)$")
+                local alias, aliasPath = normalized:match("^([%w@#?]+://)(.*)$")
                 local pathForParts = alias and aliasPath or path
                 local pathDirectory = nativeFs.getDir(pathForParts)
                 local name = nativeFs.getName(pathForParts)

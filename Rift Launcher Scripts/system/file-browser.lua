@@ -14,6 +14,10 @@ local currentDirectory = fs.combine(homeDirectory, "Files/Desktop")
 local currentRoot = homeDirectory
 local authorizedProfileRoot
 local diskMounts = {}
+local deviceEntries = {}
+local devicesPage = false
+local selectedDevice = 1
+local firstVisibleDevice = 1
 fs.makeDir(homeDirectory)
 fs.makeDir(currentDirectory)
 fs.makeDir(shellDirectory)
@@ -200,10 +204,10 @@ local function displayPath(path)
     if isWithinRoot(normalizedPath, normalizedPrivateData) then
         return "PD://" .. normalizedPath:sub(#normalizedPrivateData + 2)
     end
-    for index, mount in ipairs(diskMounts) do
-        if normalizedPath == mount.path then return "D" .. index .. "://" end
+    for _, mount in ipairs(diskMounts) do
+        if normalizedPath == mount.path then return mount.alias end
         if isWithinRoot(normalizedPath, mount.path) then
-            return "D" .. index .. "://" .. normalizedPath:sub(#mount.path + 2)
+            return mount.alias .. normalizedPath:sub(#mount.path + 2)
         end
     end
     if authorizedProfileRoot and isWithinRoot(normalizedPath, authorizedProfileRoot) then
@@ -276,16 +280,35 @@ end
 local function refreshDiskMounts()
     local mounted = {}
     for _, name in ipairs(peripheral.getNames()) do
-        local ok, peripheralType = pcall(peripheral.getType, name)
-        if ok and peripheralType == "drive" then
-            local wrapped, drive = pcall(peripheral.wrap, name)
-            if wrapped and drive and type(drive.getMountPath) == "function" then
-                local mountOk, mountPath = pcall(drive.getMountPath)
-                if mountOk and type(mountPath) == "string" then
-                    mountPath = mountPath:gsub("^/+", ""):gsub("/+$", "")
-                    if mountPath:match("^[%w_%-]+$") then
-                        mounted[mountPath] = { name = name, path = mountPath }
-                    end
+        local typeOk, peripheralType = pcall(peripheral.getType, name)
+        local mountKind = "unknown"
+        local function hasType(expected)
+            if peripheralType == expected then return true end
+            if type(peripheralType) == "table" then
+                for _, attachedType in ipairs(peripheralType) do
+                    if attachedType == expected then return true end
+                end
+            end
+            return false
+        end
+        if typeOk and hasType("hard_drive") then
+            mountKind = "hard_drive"
+        elseif typeOk and hasType("drive") then
+            mountKind = "disk"
+        end
+
+        local wrapped, drive = pcall(peripheral.wrap, name)
+        if wrapped and drive and type(drive.getMountPath) == "function" then
+            local mountOk, mountPath = pcall(drive.getMountPath)
+            if mountOk and type(mountPath) == "string" then
+                mountPath = mountPath:gsub("^/+", ""):gsub("/+$", "")
+                if mountPath:match("^[%w_%-]+$") then
+                    mounted[mountPath] = {
+                        name = name,
+                        path = mountPath,
+                        peripheral = name,
+                        kind = mountKind,
+                    }
                 end
             end
         end
@@ -298,6 +321,47 @@ local function refreshDiskMounts()
     table.sort(diskMounts, function(first, second)
         return first.path:lower() < second.path:lower()
     end)
+
+    local aliasPrefixes = { hard_drive = "HD", disk = "D", unknown = "??" }
+    local aliasNumbers = { hard_drive = 0, disk = 0, unknown = 0 }
+    for _, mount in ipairs(diskMounts) do
+        aliasNumbers[mount.kind] = aliasNumbers[mount.kind] + 1
+        mount.alias = aliasPrefixes[mount.kind] .. aliasNumbers[mount.kind] .. "://"
+    end
+
+    deviceEntries = {
+        {
+            name = "H://",
+            path = homeDirectory,
+            kind = "home",
+        },
+    }
+    if recoveryMode then
+        table.insert(deviceEntries, {
+            name = "ROOT://",
+            path = "/",
+            kind = "root",
+        })
+    end
+    table.insert(deviceEntries, {
+        name = "H@%://",
+        path = profilesDirectory,
+        kind = "profiles",
+    })
+    for _, mount in ipairs(diskMounts) do
+        table.insert(deviceEntries, {
+            name = mount.alias,
+            path = mount.path,
+            kind = "disk",
+        })
+    end
+    table.insert(deviceEntries, {
+        name = "PD://",
+        path = privateDataDirectory,
+        kind = "private",
+    })
+    selectedDevice = math.min(selectedDevice, #deviceEntries)
+    firstVisibleDevice = math.min(firstVisibleDevice, selectedDevice)
 end
 
 local function isMountedDisk(path)
@@ -359,46 +423,6 @@ local function refreshEntries()
             path = homeDirectory,
             isDirectory = true,
             returnHome = true,
-        })
-    else
-        if recoveryMode then
-            table.insert(updated, {
-                name = "ROOT://",
-                path = "/",
-                isDirectory = true,
-                isSystemDirectory = true,
-                mainRoot = true,
-                hideDirectorySuffix = true,
-            })
-        end
-        table.insert(updated, {
-            name = "[Users]",
-            path = profilesDirectory,
-            isDirectory = true,
-            profilesRoot = true,
-                isSystemDirectory = true,
-            hideDirectorySuffix = true,
-        })
-        for _, mount in ipairs(diskMounts) do
-            table.insert(updated, {
-                name = displayPath(mount.path),
-                path = mount.path,
-                isDirectory = true,
-                isSystemDirectory = true,
-                diskRoot = true,
-                hideDirectorySuffix = true,
-            })
-        end
-    end
-
-    if currentRoot == homeDirectory and altHeld then
-        table.insert(updated, {
-            name = "PD://",
-            path = privateDataDirectory,
-            isDirectory = true,
-            isSystemDirectory = true,
-            privateDataRoot = true,
-            hideDirectorySuffix = true,
         })
     end
 
@@ -494,8 +518,54 @@ local function draw()
     local highlight = term.isColor() and theme.highlight or colors.gray
     local rowCount = visibleRows(height)
     local bottomButtons
+    if devicesPage then
+        bottomButtons = {
+            { label = "BACK", action = "back" },
+            { label = "HOME", action = "home" },
+            { label = "EXIT", action = "exit" },
+        }
+        if selectedDevice < firstVisibleDevice then firstVisibleDevice = selectedDevice end
+        if selectedDevice >= firstVisibleDevice + rowCount then
+            firstVisibleDevice = selectedDevice - rowCount + 1
+        end
+
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.clear()
+        term.setCursorPos(1, 1)
+        term.setBackgroundColor(accent)
+        term.setTextColor(term.isColor() and colors.black or colors.white)
+        term.write((" RIFT LAUNCHER // DEVICES" .. string.rep(" ", width)):sub(1, width))
+        term.setTextColor(colors.lightGray)
+        term.setBackgroundColor(colors.black)
+        term.setCursorPos(2, 2)
+        term.write(("Select a device and click again to open."):sub(1, math.max(0, width - 2)))
+
+        local lastVisible = math.min(#deviceEntries, firstVisibleDevice + rowCount - 1)
+        for index = firstVisibleDevice, lastVisible do
+            local row = index - firstVisibleDevice + 3
+            local entry = deviceEntries[index]
+            term.setCursorPos(2, row)
+            if index == selectedDevice then
+                term.setBackgroundColor(highlight)
+                term.setTextColor(colors.white)
+                term.write(("> " .. entry.name):sub(1, math.max(0, width - 2)))
+                term.setBackgroundColor(colors.black)
+            else
+                term.setTextColor(term.isColor() and accent or colors.white)
+                term.write(("  " .. entry.name):sub(1, math.max(0, width - 2)))
+            end
+        end
+        term.setCursorPos(2, height - 4)
+        term.setTextColor(colors.yellow)
+        term.write(displayMessage(message):sub(1, math.max(0, width - 2)))
+        drawButtons(bottomButtons, height - 1, width)
+        term.setBackgroundColor(colors.black)
+        return bottomButtons
+    end
     if recoveryMode and currentDirectory == homeDirectory then
         bottomButtons = {
+            { label = "DEV", action = "devices" },
             { label = "HOME", action = "home" },
             { label = "CMD", action = "command" },
             { label = "EXIT", action = "exit" },
@@ -503,12 +573,14 @@ local function draw()
     elseif recoveryMode then
         bottomButtons = {
             { label = "UP", action = "up" },
+            { label = "DEV", action = "devices" },
             { label = "HOME", action = "home" },
             { label = "CMD", action = "command" },
             { label = "EXIT", action = "exit" },
         }
     elseif currentDirectory == homeDirectory then
         bottomButtons = {
+            { label = "DEV", action = "devices" },
             { label = "HOME", action = "home" },
             { label = "CMD", action = "command" },
             { label = "EXIT", action = "exit" },
@@ -516,6 +588,7 @@ local function draw()
     else
         bottomButtons = {
             { label = "UP", action = "up" },
+            { label = "DEV", action = "devices" },
             { label = "HOME", action = "home" },
             { label = "CMD", action = "command" },
             { label = "EXIT", action = "exit" },
@@ -2197,6 +2270,49 @@ local function openSelected()
     end
 end
 
+local function openSelectedDevice()
+    local entry = deviceEntries[selectedDevice]
+    if not entry then
+        message = "No devices are available."
+        return
+    end
+    if entry.kind == "home" then
+        currentRoot = homeDirectory
+        currentDirectory = homeDirectory
+        authorizedProfileRoot = nil
+        message = "Returned to your home directory."
+    elseif entry.kind == "root" then
+        currentRoot = "/"
+        currentDirectory = "/"
+        authorizedProfileRoot = nil
+        message = "Opened the main directory."
+    elseif entry.kind == "profiles" then
+        currentRoot = profilesDirectory
+        currentDirectory = profilesDirectory
+        authorizedProfileRoot = nil
+        message = "Choose a profile and enter its password."
+    elseif entry.kind == "disk" then
+        if not isMountedDisk(entry.path) then
+            message = "That device is no longer mounted."
+            refreshEntries()
+            return
+        end
+        currentRoot = entry.path
+        currentDirectory = entry.path
+        authorizedProfileRoot = nil
+        message = "Opened " .. displayPath(entry.path) .. "."
+    elseif entry.kind == "private" then
+        fs.makeDir(privateDataDirectory)
+        currentRoot = privateDataDirectory
+        currentDirectory = privateDataDirectory
+        authorizedProfileRoot = nil
+        message = "Opened private data. Keep Alt held to show hidden files."
+    end
+    devicesPage = false
+    selected = 1
+    refreshEntries()
+end
+
 local function performContextAction(action)
     if action == "copy" then
         copyOrCutSelected("copy")
@@ -2237,6 +2353,15 @@ while true do
             end
         elseif button == keys.leftCtrl or button == keys.rightCtrl then
             controlHeld = true
+        elseif button == keys.d then
+            if devicesPage then
+                devicesPage = false
+            else
+                refreshDiskMounts()
+                devicesPage = true
+                selectedDevice = 1
+                firstVisibleDevice = 1
+            end
         elseif controlHeld and button == keys.c then
             copyOrCutSelected("copy")
         elseif controlHeld and button == keys.x then
@@ -2246,8 +2371,13 @@ while true do
         elseif button == keys.n or button == keys.v then
             local _, height = term.getSize()
             local direction = button == keys.n and 1 or -1
-            selected = math.max(1, math.min(#entries,
-                selected + direction * visibleRows(height)))
+            if devicesPage then
+                selectedDevice = math.max(1, math.min(#deviceEntries,
+                    selectedDevice + direction * visibleRows(height)))
+            else
+                selected = math.max(1, math.min(#entries,
+                    selected + direction * visibleRows(height)))
+            end
         end
     elseif event == "key_up" then
         if button == keys.leftAlt or button == keys.rightAlt then
@@ -2261,18 +2391,28 @@ while true do
     elseif event == "mouse_scroll" then
         local _, height = term.getSize()
         if y >= 3 and y < 3 + visibleRows(height) then
-            selected = math.max(1, math.min(#entries, selected + button))
+            if devicesPage then
+                selectedDevice = math.max(1, math.min(#deviceEntries, selectedDevice + button))
+            else
+                selected = math.max(1, math.min(#entries, selected + button))
+            end
         end
     elseif event == "mouse_click" then
         local _, height = term.getSize()
         local index = firstVisible + y - 3
-        if button == 2 then
+        local deviceIndex = firstVisibleDevice + y - 3
+        if devicesPage and button == 1 and y >= 3 and y < 3 + visibleRows(height)
+            and deviceIndex >= firstVisibleDevice and deviceIndex <= #deviceEntries then
+            local wasSelected = selectedDevice == deviceIndex
+            selectedDevice = deviceIndex
+            if wasSelected then openSelectedDevice() end
+        elseif not devicesPage and button == 2 then
             if y >= 3 and y < 3 + visibleRows(height)
                 and index >= firstVisible and index <= #entries then
                 selected = index
             end
             contextMenu = { x = x, y = y }
-        elseif contextMenu then
+        elseif not devicesPage and contextMenu then
             local width = term.getSize()
             local menuX, menuY, menuWidth, menuHeight = contextMenuLayout(width, height)
             local menuIndex = y - menuY + 1
@@ -2284,7 +2424,7 @@ while true do
             else
                 contextMenu = nil
             end
-        elseif button == 1 and y >= 3 and y < 3 + visibleRows(height)
+        elseif not devicesPage and button == 1 and y >= 3 and y < 3 + visibleRows(height)
             and index >= firstVisible and index <= #entries then
             local wasSelected = selected == index
             selected = index
@@ -2305,9 +2445,17 @@ while true do
                 currentDirectory = homeDirectory
                 currentRoot = homeDirectory
                 authorizedProfileRoot = nil
+                devicesPage = false
                 selected = 1
                 refreshEntries()
                 message = "Returned to your home directory."
+            elseif action == "devices" then
+                refreshDiskMounts()
+                devicesPage = true
+                selectedDevice = 1
+                firstVisibleDevice = 1
+            elseif action == "back" then
+                devicesPage = false
             elseif action == "command" then
                 commandPrompt()
             elseif action == "exit" then
