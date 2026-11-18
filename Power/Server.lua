@@ -36,7 +36,7 @@ end
 
 local energyStorage = peripheral.wrap("back")
 local monitors = {peripheral.find("monitor")}
-local networkEnergyStorage = peripheral.find("quantumEntangloporter")
+local networkEnergyStorage = peripheral.wrap("ultimateEnergyCube_0")
 local reactor = peripheral.find("fusionReactorLogicAdapter")
 local deuteriumTank = peripheral.wrap("ultimateChemicalTank_0")
 local tritiumTank = peripheral.wrap("ultimateChemicalTank_1")
@@ -233,12 +233,12 @@ local function findEnergy()
     end
 end
 local function energyLoad()
-    reactor.setInjectionRate(30)
+    reactor.setInjectionRate(60)
     while true do
         energy = energyStorage.getEnergy() / 2.5
         cap = energyStorage.getMaxEnergy() / 2.5
-        nenergy = networkEnergyStorage.getEnergy() / 2.5
-        ncap = networkEnergyStorage.getMaxEnergy() / 2.5
+        nenergy = (networkEnergyStorage.getEnergy() / 2.5)
+        ncap = (networkEnergyStorage.getMaxEnergy() / 2.5)
         plasmaTemp = reactor.getPlasmaTemperature()
         DeuteriumAmt = reactor.getDeuterium().amount + deuteriumTank.getStored().amount
         TritiumAmt = reactor.getTritium().amount + tritiumTank.getStored().amount
@@ -246,21 +246,21 @@ local function energyLoad()
         npercent = ncap > 0 and nenergy / ncap * 100 or 0
 
         if percent >= 100 and not SleepMode then
-            reactor.setInjectionRate(10)
+            reactor.setInjectionRate(60)
             SleepMode = true
             OverclockMode = false
             print("Sleep Mode Activated Due To Power Full")
         elseif percent <= 90 and SleepMode then
-            reactor.setInjectionRate(30)
+            reactor.setInjectionRate(80)
             SleepMode = false
             print("Sleep Mode Deactivated Due To Power Going Below 90%")
         elseif percent <= 40 and not SleepMode and not OverclockMode then
-            reactor.setInjectionRate(60)
+            reactor.setInjectionRate(100)
             OverclockMode = true
             print("Overclock Mode Activated Due To Power Going Below 40%")
         elseif SleepMode and not OverclockMode
-            and reactor.getInjectionRate() ~= 10 then
-            reactor.setInjectionRate(10)
+            and reactor.getInjectionRate() ~= 60 then
+            reactor.setInjectionRate(60)
         end
 
         sleep()

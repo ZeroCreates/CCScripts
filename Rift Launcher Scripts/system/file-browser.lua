@@ -24,6 +24,7 @@ local message = ""
 local clipboard
 local controlHeld = false
 local altHeld = false
+local contextMenu
 local privateEditSequence = 0
 local themeIndex = 1
 local themes = {
@@ -451,29 +452,51 @@ local function buttonAt(buttons, x)
     end
 end
 
+local contextMenuItems = {
+    { label = "COPY", action = "copy" },
+    { label = "CUT", action = "cut" },
+    { label = "NEW FILE", action = "create" },
+    { label = "NEW FOLDER", action = "create-folder" },
+    { label = "EDIT", action = "edit" },
+    { label = "OPEN", action = "open" },
+    { label = "DELETE", action = "delete" },
+    { label = "RENAME", action = "rename" },
+    { label = "RUN", action = "run" },
+    { label = "PASTE", action = "paste" },
+    { label = "UPLOAD", action = "upload" },
+}
+
+local function contextMenuLayout(width, height)
+    if not contextMenu then return nil end
+    local menuWidth = math.min(12, width)
+    local menuHeight = math.min(#contextMenuItems, height)
+    local x = math.max(1, math.min(contextMenu.x, width - menuWidth + 1))
+    local y = math.max(1, math.min(contextMenu.y, height - menuHeight + 1))
+    return x, y, menuWidth, menuHeight
+end
+
+local function drawContextMenu(width, height)
+    local x, y, menuWidth, menuHeight = contextMenuLayout(width, height)
+    if not x then return end
+    for index = 1, menuHeight do
+        local item = contextMenuItems[index]
+        term.setCursorPos(x, y + index - 1)
+        term.setBackgroundColor(term.isColor() and colors.gray or colors.black)
+        term.setTextColor(colors.white)
+        term.write((" " .. item.label .. string.rep(" ", menuWidth)):sub(1, menuWidth))
+    end
+end
+
 local function draw()
     local width, height = term.getSize()
     local theme = themes[themeIndex]
     local accent = term.isColor() and theme.accent or colors.gray
     local highlight = term.isColor() and theme.highlight or colors.gray
     local rowCount = visibleRows(height)
-    local topButtons = {
-        { label = "NEW FILE", action = "create" },
-        { label = "FOLDER", action = "create-folder" },
-        { label = "EDIT", action = "edit" },
-        { label = "OPEN", action = "open" },
-    }
-    local selectedEntry = entries[selected]
-    if selectedEntry and not selectedEntry.isDirectory
-        and selectedEntry.path:lower():match("%.lua$")
-        and isWithinRoot(selectedEntry.path, homeDirectory) and not recoveryMode then
-        table.insert(topButtons, { label = "RUN", action = "run" })
-    end
     local bottomButtons
     if recoveryMode and currentDirectory == homeDirectory then
         bottomButtons = {
             { label = "HOME", action = "home" },
-            { label = "DELETE", action = "delete" },
             { label = "CMD", action = "command" },
             { label = "EXIT", action = "exit" },
         }
@@ -481,14 +504,12 @@ local function draw()
         bottomButtons = {
             { label = "UP", action = "up" },
             { label = "HOME", action = "home" },
-            { label = "DELETE", action = "delete" },
             { label = "CMD", action = "command" },
             { label = "EXIT", action = "exit" },
         }
     elseif currentDirectory == homeDirectory then
         bottomButtons = {
             { label = "HOME", action = "home" },
-            { label = "DELETE", action = "delete" },
             { label = "CMD", action = "command" },
             { label = "EXIT", action = "exit" },
         }
@@ -496,7 +517,6 @@ local function draw()
         bottomButtons = {
             { label = "UP", action = "up" },
             { label = "HOME", action = "home" },
-            { label = "DELETE", action = "delete" },
             { label = "CMD", action = "command" },
             { label = "EXIT", action = "exit" },
         }
@@ -540,10 +560,10 @@ local function draw()
     term.setCursorPos(2, height - 4)
     term.setTextColor(colors.yellow)
     term.write(displayMessage(message):sub(1, math.max(0, width - 2)))
-    drawButtons(topButtons, height - 2, width)
     drawButtons(bottomButtons, height - 1, width)
+    drawContextMenu(width, height)
     term.setBackgroundColor(colors.black)
-    return topButtons, bottomButtons
+    return bottomButtons
 end
 
 local function editSelected()
@@ -809,6 +829,141 @@ local function resolveHomePath(base, input)
     return path
 end
 
+local function uploadFilePath(source, commandRoot)
+    if type(http) ~= "table" or type(http.post) ~= "function" then
+        return false, "Enable the ComputerCraft HTTP API to upload files."
+    end
+    if not source or source == commandRoot or not isWithinRoot(source, commandRoot)
+        or not fs.exists(source) or fs.isDir(source) then
+        return false, recoveryMode and "File not found." or "File not found inside your home directory."
+    end
+    if isRecoveryProtectedPath(source) then
+        return false, "That file is unavailable in recovery mode."
+    end
+    local fileName = fs.getName(source)
+    if not fileName:match("^[%w_.%-]+%.lua$") then
+        return false, "Only .lua files can be uploaded."
+    end
+
+    local file, openError = fs.open(source, "rb")
+    if not file then return false, "Could not open file: " .. tostring(openError) end
+    local readOk, contents = pcall(file.readAll)
+    local closeOk, closeError = pcall(file.close)
+    if not readOk then return false, "Could not read file: " .. tostring(contents) end
+    if not closeOk then return false, "Could not close file: " .. tostring(closeError) end
+    if type(contents) ~= "string" then return false, "File did not contain readable bytes." end
+
+    local requestOk, response, requestError = pcall(http.post, SHARE_UPLOAD_URL, contents, {
+        ["Content-Type"] = "application/octet-stream",
+        ["X-Filename"] = fileName,
+    })
+    if not requestOk then return false, "Upload request failed: " .. tostring(response) end
+    if not response then
+        return false, "Upload request failed: " .. tostring(requestError or "no response")
+    end
+
+    local responseCode
+    if type(response.getResponseCode) == "function" then
+        local codeOk, code = pcall(response.getResponseCode)
+        if not codeOk then
+            pcall(response.close)
+            return false, "Could not read the upload response status: " .. tostring(code)
+        end
+        responseCode = code
+    end
+    if responseCode and (responseCode < 200 or responseCode >= 300) then
+        pcall(response.close)
+        return false, "Upload failed with HTTP " .. tostring(responseCode) .. "."
+    end
+
+    local responseOk, responseBody = pcall(response.readAll)
+    local responseClosed, responseCloseError = pcall(response.close)
+    if not responseOk then return false, "Could not read upload response: " .. tostring(responseBody) end
+    if not responseClosed then
+        return false, "Could not close upload response: " .. tostring(responseCloseError)
+    end
+    local decoded, share = pcall(textutils.unserializeJSON, responseBody)
+    if not decoded or type(share) ~= "table"
+        or type(share.id) ~= "string" or share.id == ""
+        or type(share.url) ~= "string" or share.url == "" then
+        return false, "Share server returned an invalid response."
+    end
+    return true, share.id, share.url
+end
+
+local function showUploadResult(id, url)
+    local width, height = term.getSize()
+    local lines = {}
+    local function appendWrapped(text)
+        text = tostring(text)
+        if text == "" then
+            table.insert(lines, "")
+            return
+        end
+        while #text > width do
+            table.insert(lines, text:sub(1, width))
+            text = text:sub(width + 1)
+        end
+        table.insert(lines, text)
+    end
+
+    appendWrapped("Share ID:")
+    appendWrapped(id)
+    appendWrapped("")
+    appendWrapped("Share link:")
+    appendWrapped(url)
+
+    local contentRows = math.max(1, height - 2)
+    local lineIndex = 1
+    repeat
+        term.setBackgroundColor(colors.black)
+        term.setTextColor(colors.white)
+        term.clear()
+        if height >= 3 then
+            term.setCursorPos(1, 1)
+            term.setBackgroundColor(term.isColor() and themes[themeIndex].accent or colors.gray)
+            term.write((" RIFT LAUNCHER // UPLOAD COMPLETE" .. string.rep(" ", width))
+                :sub(1, width))
+            term.setBackgroundColor(colors.black)
+        end
+
+        local firstContentRow = height >= 3 and 2 or 1
+        for offset = 0, contentRows - 1 do
+            if lineIndex > #lines then break end
+            term.setCursorPos(1, firstContentRow + offset)
+            term.write(lines[lineIndex])
+            lineIndex = lineIndex + 1
+        end
+
+        term.setCursorPos(1, height)
+        term.setTextColor(colors.lightGray)
+        local prompt = lineIndex <= #lines and "Press any key for more..."
+            or "Press any key to return"
+        term.write(prompt:sub(1, width))
+        while true do
+            local event = os.pullEventRaw()
+            if event == "key" or event == "mouse_click" then break end
+        end
+    until lineIndex > #lines
+end
+
+local function uploadSelected()
+    local entry = entries[selected]
+    if not entry or entry.isDirectory then
+        message = "Select a Lua file to upload."
+        return
+    end
+
+    local commandRoot = recoveryMode and "/" or homeDirectory
+    local ok, id, url = uploadFilePath(entry.path, commandRoot)
+    if not ok then
+        message = id
+        return
+    end
+    showUploadResult(id, url)
+    message = "Upload complete. Share ID and link shown."
+end
+
 local function tokenizeCommand(line)
     local arguments, current, quote, escaped = {}, "", nil, false
     for index = 1, #line do
@@ -959,69 +1114,8 @@ local function commandPrompt()
         return true, "Downloaded " .. tostring(#contents) .. " bytes to " .. displayPath(destination) .. "."
     end
     local function uploadFile(sourceInput)
-        if type(http) ~= "table" or type(http.post) ~= "function" then
-            return false, "Enable the ComputerCraft HTTP API to upload files."
-        end
-        if type(sourceInput) ~= "string" or sourceInput == "" then
-            return false, "Usage: upload <file.lua>"
-        end
-
         local source = resolvePath(sourceInput)
-        if not source or source == commandRoot or not fs.exists(source) or fs.isDir(source) then
-            return false, recoveryMode and "File not found." or "File not found inside your home directory."
-        end
-        if isRecoveryProtectedPath(source) then
-            return false, "That file is unavailable in recovery mode."
-        end
-        local fileName = fs.getName(source)
-        if not fileName:match("^[%w_.%-]+%.lua$") then
-            return false, "Only .lua files can be uploaded."
-        end
-
-        local file, openError = fs.open(source, "rb")
-        if not file then return false, "Could not open file: " .. tostring(openError) end
-        local readOk, contents = pcall(file.readAll)
-        local closeOk, closeError = pcall(file.close)
-        if not readOk then return false, "Could not read file: " .. tostring(contents) end
-        if not closeOk then return false, "Could not close file: " .. tostring(closeError) end
-        if type(contents) ~= "string" then return false, "File did not contain readable bytes." end
-
-        local requestOk, response, requestError = pcall(http.post, SHARE_UPLOAD_URL, contents, {
-            ["Content-Type"] = "application/octet-stream",
-            ["X-Filename"] = fileName,
-        })
-        if not requestOk then return false, "Upload request failed: " .. tostring(response) end
-        if not response then
-            return false, "Upload request failed: " .. tostring(requestError or "no response")
-        end
-
-        local responseCode
-        if type(response.getResponseCode) == "function" then
-            local codeOk, code = pcall(response.getResponseCode)
-            if not codeOk then
-                pcall(response.close)
-                return false, "Could not read the upload response status: " .. tostring(code)
-            end
-            responseCode = code
-        end
-        if responseCode and (responseCode < 200 or responseCode >= 300) then
-            pcall(response.close)
-            return false, "Upload failed with HTTP " .. tostring(responseCode) .. "."
-        end
-
-        local responseOk, responseBody = pcall(response.readAll)
-        local responseClosed, responseCloseError = pcall(response.close)
-        if not responseOk then return false, "Could not read upload response: " .. tostring(responseBody) end
-        if not responseClosed then
-            return false, "Could not close upload response: " .. tostring(responseCloseError)
-        end
-        local decoded, share = pcall(textutils.unserializeJSON, responseBody)
-        if not decoded or type(share) ~= "table"
-            or type(share.id) ~= "string" or share.id == ""
-            or type(share.url) ~= "string" or share.url == "" then
-            return false, "Share server returned an invalid response."
-        end
-        return true, share.id, share.url
+        return uploadFilePath(source, commandRoot)
     end
     local function resolveProgram(command)
         local paths = {}
@@ -1332,8 +1426,8 @@ local function commandPrompt()
                 else
                     local ok, id, url = uploadFile(arguments[2])
                     if ok then
-                        writePromptLine(id, colors.lime)
-                        writePromptLine(url, colors.cyan)
+                        showUploadResult(id, url)
+                        drawPromptHeader()
                     else
                         writePromptLine(id, colors.red)
                     end
@@ -1549,6 +1643,70 @@ local function deleteSelected()
     end
     refreshEntries()
     message = "Deleted " .. entry.name .. "."
+end
+
+local function renameSelected()
+    local entry = entries[selected]
+    if not entry or entry.name == ".." or entry.diskRoot or entry.returnHome
+        or entry.profilesRoot or entry.profileRoot
+        or not isWithinRoot(entry.path, currentRoot) or entry.path == currentRoot then
+        message = "Select a file or folder to rename."
+        return
+    end
+    if isRecoveryProtectedPath(entry.path)
+        or entry.isDirectory and containsRecoveryProtectedPath(entry.path) then
+        message = "That location is unavailable in recovery mode."
+        return
+    end
+
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("Rename " .. displayPath(entry.path))
+    write("New name: ")
+    local name = read()
+    if name == "" then
+        message = "Rename cancelled."
+        return
+    end
+    if name:find("[/\\:]", 1) or name == "." or name == ".." then
+        message = "Enter a name, not a path."
+        return
+    end
+    if name == entry.name then
+        message = entry.name .. " already has that name."
+        return
+    end
+
+    local destination = fs.combine(currentDirectory, name)
+    if isRecoveryProtectedPath(destination)
+        or entry.isDirectory and containsRecoveryProtectedPath(destination) then
+        message = "That location is unavailable in recovery mode."
+        return
+    end
+    if not isWithinRoot(destination, currentRoot) or destination == currentRoot then
+        message = "That location is outside the current root."
+        return
+    end
+    if fs.exists(destination) then
+        message = "That file or folder already exists."
+        return
+    end
+
+    local ok, err = pcall(fs.move, entry.path, destination)
+    if not ok then
+        message = "Could not rename " .. entry.name .. ": " .. tostring(err)
+        return
+    end
+    refreshEntries()
+    for index, refreshedEntry in ipairs(entries) do
+        if refreshedEntry.path == destination then
+            selected = index
+            break
+        end
+    end
+    message = "Renamed " .. entry.name .. " to " .. name .. "."
 end
 
 local function copyOrCutSelected(mode)
@@ -1769,11 +1927,39 @@ local function openSelected()
     end
 end
 
+local function performContextAction(action)
+    if action == "copy" then
+        copyOrCutSelected("copy")
+    elseif action == "cut" then
+        copyOrCutSelected("cut")
+    elseif action == "create" then
+        createFile()
+    elseif action == "create-folder" then
+        createFolder()
+    elseif action == "edit" then
+        editSelected()
+    elseif action == "open" then
+        openSelected()
+    elseif action == "delete" then
+        deleteSelected()
+    elseif action == "rename" then
+        renameSelected()
+    elseif action == "run" then
+        runSelected()
+    elseif action == "paste" then
+        pasteClipboard()
+    elseif action == "upload" then
+        uploadSelected()
+    end
+end
+
 refreshEntries()
 while true do
-    local topButtons, bottomButtons = draw()
+    local bottomButtons = draw()
     local event, button, x, y = os.pullEventRaw()
-    if event == "key" then
+    if contextMenu and event == "key" then
+        contextMenu = nil
+    elseif event == "key" then
         if button == keys.leftAlt or button == keys.rightAlt then
             if not altHeld then
                 altHeld = true
@@ -1810,24 +1996,29 @@ while true do
     elseif event == "mouse_click" then
         local _, height = term.getSize()
         local index = firstVisible + y - 3
-        if button == 1 and y >= 3 and y < 3 + visibleRows(height)
+        if button == 2 then
+            if y >= 3 and y < 3 + visibleRows(height)
+                and index >= firstVisible and index <= #entries then
+                selected = index
+            end
+            contextMenu = { x = x, y = y }
+        elseif contextMenu then
+            local width = term.getSize()
+            local menuX, menuY, menuWidth, menuHeight = contextMenuLayout(width, height)
+            local menuIndex = y - menuY + 1
+            if button == 1 and x >= menuX and x < menuX + menuWidth
+                and menuIndex >= 1 and menuIndex <= menuHeight then
+                local action = contextMenuItems[menuIndex].action
+                contextMenu = nil
+                performContextAction(action)
+            else
+                contextMenu = nil
+            end
+        elseif button == 1 and y >= 3 and y < 3 + visibleRows(height)
             and index >= firstVisible and index <= #entries then
             local wasSelected = selected == index
             selected = index
             if button == 1 and wasSelected then openSelected() end
-        elseif button == 1 and y == height - 2 then
-            local action = buttonAt(topButtons, x)
-            if action == "create" then
-                createFile()
-            elseif action == "create-folder" then
-                createFolder()
-            elseif action == "edit" then
-                editSelected()
-            elseif action == "open" then
-                openSelected()
-            elseif action == "run" then
-                runSelected()
-            end
         elseif button == 1 and y == height - 1 then
             local action = buttonAt(bottomButtons, x)
             if action == "up" and currentDirectory ~= homeDirectory then
@@ -1847,8 +2038,6 @@ while true do
                 selected = 1
                 refreshEntries()
                 message = "Returned to your home directory."
-            elseif action == "delete" then
-                deleteSelected()
             elseif action == "command" then
                 commandPrompt()
             elseif action == "exit" then
