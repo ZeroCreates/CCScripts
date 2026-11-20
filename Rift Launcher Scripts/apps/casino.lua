@@ -138,7 +138,6 @@ local function serverRequest(message)
     message.riftSession = rift.networkSession
     message.requestId = message.requestId or nextRequestId()
     for _ = 1, 2 do
-            if response.type == "error" then
         local sent, sendError = wifi.send(CASINO_SERVER, message)
         if not sent then return nil, sendError or "Could not send to Rift Casino." end
         local deadline = os.clock() + TIMEOUT
