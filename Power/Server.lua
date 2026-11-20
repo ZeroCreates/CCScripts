@@ -24,15 +24,6 @@ if not fs.exists(discordHookPath) then
     file.write(hookSource)
     file.close()
 end
-
-local discord = require("DiscordHook")
-local success, discordHook = discord.createWebhook(
-    "https://discord.com/api/webhooks/1354695613115007006/ZjsQOGmVl9bnhccAtjYWjiSmDbaTYD8s0_8QhNMLGIYd2v4CKZlnPM4BFDmsnMbAFsJH"
-)
-if not success then
-    error(discordHook)
-end
-
 local monitors = {peripheral.find("monitor")}
 local reactor = peripheral.find("fusionReactorLogicAdapter")
 if not reactor then error("Fusion reactor peripheral not found.") end
@@ -52,7 +43,6 @@ if fs.exists(CONFIG_PATH) then
         end
     end
 end
-
 local function peripheralTypes(name)
     local values = {peripheral.getType(name)}
     local result = {}
@@ -205,6 +195,16 @@ else
     modemName = modemDefault
 end
 
+if not config.discordWebhookURL then
+    print("Discord webhook URL not found in configuration.")
+    print("enter Discord webhook URL: ")
+    config.discordWebhookURL = read()
+    local file = fs.open(CONFIG_PATH, "w")
+    if file then
+        file.write(textutils.serialize(config))
+        file.close()
+    end
+end
 config.deuteriumTank = deuteriumTankName
 config.tritiumTank = tritiumTankName
 config.energyStorage = energyStorageName
@@ -219,6 +219,13 @@ local rednetModem = peripheral.wrap(modemName)
 if not rednetModem then error("Could not open the selected modem: " .. modemName) end
 rednet.open(modemName)
 
+local discord = require("DiscordHook")
+local success, discordHook = discord.createWebhook(
+    config.discordWebhookURL
+)
+if not success then
+    error(discordHook)
+end
 local deuteriumTank = peripheral.wrap(deuteriumTankName)
 local tritiumTank = peripheral.wrap(tritiumTankName)
 local energyStorage = peripheral.wrap(energyStorageName)
