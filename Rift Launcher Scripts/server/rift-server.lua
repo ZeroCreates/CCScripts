@@ -1,13 +1,9 @@
 local PROTOCOL = "rift_jobs_v1"
 local ACCOUNT_PROTOCOL = "rift_account_v1"
-local LOGIN_SERVER_NAME = "rift-server"
-local JOBS_SERVER_NAME = "rift-jobs"
+local SERVER_DOMAIN = "rift.local"
 local MARKET_PROTOCOL = "order_system_v1"
-local MARKET_SERVER_NAME = "rift-market"
 local MAIL_PROTOCOL = "rift_mail_v1"
-local MAIL_SERVER_NAME = "rift-mail"
 local CASINO_PROTOCOL = "rift_casino_wallet_v1"
-local CASINO_SERVER_NAME = "rift-casino"
 local DATA_FILE = "jobs.db"
 local BACKUP_FILE = "jobs.db.bak"
 local TEMP_FILE = "jobs.db.tmp"
@@ -25,16 +21,152 @@ local handleMailRequest
 local getMailStats
 local handleCasinoRequest
 local getCasinoStats
+local serverWifi
+local senderRoutes = {}
+
+local function logValue(value)
+    if type(value) ~= "string" then return "<invalid>" end
+    return value:gsub("%c", "?"):sub(1, 80)
+end
+
+local function logEvent(event, details)
+    local timestamp = os.date("!%Y-%m-%d %H:%M:%S", math.floor(os.epoch("utc") / 1000))
+    print("[" .. timestamp .. " UTC] " .. event .. (details and " | " .. details or ""))
+end
+
+local function networkSend(recipient, message, protocol)
+    if not serverWifi then
+        logEvent("REPLY FAILED", "Wi-Fi is not connected")
+        return false, "The Rift Wi-Fi transport is not connected."
+    end
+    local route = senderRoutes[recipient]
+    if not route then
+        logEvent("REPLY FAILED", "No Wi-Fi reply route")
+        return false, "No Wi-Fi reply route."
+    end
+    message.riftService = protocol
+    message.riftSession = route.session
+    local sent, sendError
+    if route.wan then
+        sent, sendError = serverWifi.sendWAN(route.wan, route.lan, message)
+    else
+        sent, sendError = serverWifi.send(route.lan, message)
+    end
+    local details = logValue(protocol) .. " " .. logValue(message.type)
+        .. " to " .. logValue(route.address)
+    if sent then
+        logEvent("REPLY SENT", details)
+    else
+        logEvent("REPLY FAILED", details .. " | " .. logValue(tostring(sendError)))
+    end
+    return sent, sendError
+end
+
+local function networkReceive(timeout)
+    if not serverWifi then return nil end
+    local packet = serverWifi.receive(timeout)
+    if packet == nil then return nil end
+    if type(packet) ~= "table" or type(packet.message) ~= "table" then
+        logEvent("PACKET IGNORED", "Invalid packet or message")
+        return nil
+    end
+    local service, session = packet.message.riftService, packet.message.riftSession
+    if service ~= ACCOUNT_PROTOCOL and service ~= PROTOCOL and service ~= MARKET_PROTOCOL
+        and service ~= MAIL_PROTOCOL and service ~= CASINO_PROTOCOL then
+        logEvent("PACKET IGNORED", "Unknown service: " .. logValue(service))
+        return nil
+    end
+    if type(session) ~= "string" or #session < 1 or #session > 64
+        or not session:match("^[%w%-]+$") then
+        logEvent("PACKET IGNORED", "Invalid session")
+        return nil
+    end
+    local lan = packet.fromLan or packet.from
+    if type(lan) ~= "string" or lan == "" then
+        logEvent("PACKET IGNORED", "Missing sender address")
+        return nil
+    end
+    local wan = packet.fromWan
+    if type(wan) ~= "string" or wan == "" or wan == serverWifi.getWanIP() then wan = nil end
+    local address = wan and (wan .. "/" .. lan) or lan
+    local senderId = address .. "/" .. session
+    senderRoutes[senderId] = { wan = wan, lan = lan, address = address, session = session }
+    logEvent("REQUEST", logValue(service) .. " " .. logValue(packet.message.type)
+        .. " from " .. logValue(address))
+    return senderId, packet.message, service
+end
+
+local function setupServerWifi()
+    logEvent("STARTUP", "Loading Wi-Fi module")
+    local ok, wifi = pcall(require, "wifi")
+    if not ok or type(wifi) ~= "table" then
+        return false, "The wifi Lua module is not available."
+    end
+    local router = peripheral and peripheral.find and peripheral.find("wifi_router")
+    local ssid, password = "Rift", ""
+    local configPath = "/rift/network.json"
+    if fs.exists(configPath) and not fs.isDir(configPath) then
+        local file = fs.open(configPath, "r")
+        if file then
+            local contents = file.readAll()
+            file.close()
+            local parsed, saved = pcall(textutils.unserialize, contents)
+            if parsed and type(saved) == "table" then
+                if type(saved.ssid) == "string" and saved.ssid ~= "" then ssid = saved.ssid end
+                if type(saved.password) == "string" then password = saved.password end
+                logEvent("WIFI", "Grabed Saved Network Configuration")
+            end
+        end
+    end
+    if router then
+        if type(wifi.configureWifi) == "function" then
+            logEvent("WIFI", "Configuring attached router")
+            local configured, configureError = wifi.configureWifi(ssid, password)
+            if configured == false then
+                return false, "Could not configure the Wi-Fi router: "
+                    .. tostring(configureError or "unknown error")
+            end
+        end
+    end
+    logEvent("WIFI", "Connecting to " .. logValue(ssid))
+    local connected, connectError = wifi.connect(ssid, password)
+    if not connected then return false, connectError or "Could not connect to the Rift Wi-Fi network." end
+    if type(wifi.registerDomain) ~= "function" then
+        return false, "The wifi module cannot register a server domain."
+    end
+
+    local lanIP = type(wifi.getIP) == "function" and wifi.getIP() or nil
+    local wanIP = type(wifi.getWanIP) == "function" and wifi.getWanIP() or nil
+    logEvent("WIFI", "Connected | LAN " .. logValue(lanIP) .. " | WAN " .. logValue(wanIP))
+    logEvent("WIFI", "Registering domain " .. SERVER_DOMAIN)
+    local registered, registerResult, registerError = pcall(wifi.registerDomain, SERVER_DOMAIN)
+    if not registered or registerResult == false then
+        return false, "Could not register " .. SERVER_DOMAIN .. ": "
+            .. tostring(registerResult == false and registerError or registerResult)
+    end
+    serverWifi = wifi
+    logEvent("WIFI", "Domain registered")
+    return true
+end
 
 local function openModems()
+    logEvent("STARTUP", "Checking for a modem")
     local found = false
     for _, name in ipairs(peripheral.getNames()) do
         if peripheral.getType(name) == "modem" then
-            if not rednet.isOpen(name) then rednet.open(name) end
             found = true
         end
     end
-    if not found then error("Attach a modem before starting the combined Rift server.") end
+    if not found then
+        logEvent("STARTUP FAILED", "No modem attached")
+        error("Attach a modem before starting the combined Rift server.")
+    end
+
+    local connected, networkError = setupServerWifi()
+    if not connected then
+        logEvent("STARTUP FAILED", "Wi-Fi connection failed: " .. logValue(tostring(networkError)))
+        error("Wi-Fi server connection failed: " .. tostring(networkError or "unknown error"), 0)
+    end
 end
 
 local function readState(path)
@@ -107,9 +239,18 @@ local function loadState()
     return loaded, hasEmbeddedAccounts
 end
 
+local previousJobsSaveError
+local function logJobsSaveError(message)
+    if message ~= previousJobsSaveError then logEvent("STATE FAILED", message) end
+    previousJobsSaveError = message
+end
+
 local function saveState()
     local file = fs.open(TEMP_FILE, "w")
-    if not file then return false, "Could not create the temporary Jobs data file." end
+    if not file then
+        logJobsSaveError("Could not create the temporary Jobs data file")
+        return false, "Could not create the temporary Jobs data file."
+    end
     file.write(textutils.serialize({
         nextId = state.nextId,
         jobs = state.jobs,
@@ -121,15 +262,21 @@ local function saveState()
     local ok, saveError = pcall(fs.move, TEMP_FILE, DATA_FILE)
     if not ok then
         if fs.exists(BACKUP_FILE) and not fs.exists(DATA_FILE) then fs.move(BACKUP_FILE, DATA_FILE) end
+        logJobsSaveError("Could not save Jobs data: " .. logValue(tostring(saveError)))
         return false, "Could not save Jobs data: " .. tostring(saveError)
     end
     if fs.exists(BACKUP_FILE) then fs.delete(BACKUP_FILE) end
+    previousJobsSaveError = nil
+    logEvent("STATE SAVED", "Jobs")
     return true
 end
 
 local function saveAccounts()
     local file = fs.open(ACCOUNTS_TEMP_FILE, "w")
-    if not file then return false, "Could not create the temporary Rift account data file." end
+    if not file then
+        logEvent("STATE FAILED", "Could not create the temporary Rift account data file")
+        return false, "Could not create the temporary Rift account data file."
+    end
     file.write(textutils.serialize({ accounts = state.accounts }))
     file.close()
 
@@ -140,14 +287,16 @@ local function saveAccounts()
         if fs.exists(ACCOUNTS_BACKUP_FILE) and not fs.exists(ACCOUNTS_FILE) then
             fs.move(ACCOUNTS_BACKUP_FILE, ACCOUNTS_FILE)
         end
+        logEvent("STATE FAILED", "Could not save account data: " .. logValue(tostring(saveError)))
         return false, "Could not save Rift account data: " .. tostring(saveError)
     end
     if fs.exists(ACCOUNTS_BACKUP_FILE) then fs.delete(ACCOUNTS_BACKUP_FILE) end
+    logEvent("STATE SAVED", "Accounts")
     return true
 end
 
 local function sendError(senderId, message, protocol)
-    rednet.send(senderId, { type = "error", message = message }, protocol or ACCOUNT_PROTOCOL)
+    networkSend(senderId, { type = "error", message = message }, protocol or ACCOUNT_PROTOCOL)
 end
 
 local requestLimits = {}
@@ -270,7 +419,7 @@ local function registerAccount(senderId, message, protocol)
         return sendError(senderId, saveError, protocol)
     end
     sessions[senderId] = username
-    rednet.send(senderId, { type = "authenticated", username = username }, protocol or ACCOUNT_PROTOCOL)
+    networkSend(senderId, { type = "authenticated", username = username }, protocol or ACCOUNT_PROTOCOL)
 end
 
 local function persistAccountMigration(legacyAccountsEmbedded)
@@ -330,13 +479,13 @@ end
 local function loginAccount(senderId, message, protocol)
     local account = findAccount(message.username)
     local accountId = account and account.username:lower()
-    if rateLimited(loginSenderLimits, senderId, 5, 60)
+    if rateLimited(loginSenderLimits, senderRoutes[senderId].address, 5, 60)
         or (accountId and rateLimited(loginAccountLimits, accountId, 10, 60)) then
         return sendError(senderId, "Too many sign-in attempts. Try again later.", protocol)
     end
     if not account or type(message.password) ~= "string"
         or account.password ~= message.password then
-        local recorded = recordRate(loginSenderLimits, senderId, 60)
+        local recorded = recordRate(loginSenderLimits, senderRoutes[senderId].address, 60)
         if accountId then recorded = recordRate(loginAccountLimits, accountId, 60) and recorded end
         if not recorded then
             return sendError(senderId, "Too many sign-in attempts. Try again later.", protocol)
@@ -344,7 +493,7 @@ local function loginAccount(senderId, message, protocol)
         return sendError(senderId, "Username or password is incorrect.", protocol)
     end
     sessions[senderId] = account.username
-    rednet.send(senderId, { type = "authenticated", username = account.username }, protocol or ACCOUNT_PROTOCOL)
+    networkSend(senderId, { type = "authenticated", username = account.username }, protocol or ACCOUNT_PROTOCOL)
 end
 
 local function lookupAccount(senderId, message, protocol)
@@ -356,7 +505,7 @@ local function lookupAccount(senderId, message, protocol)
     end
     local account = findAccount(message.identifier)
     if not account then return sendError(senderId, "Rift account not found.", protocol) end
-    rednet.send(senderId, {
+    networkSend(senderId, {
         type = "account_lookup", username = account.username, uuid = account.uuid,
     }, protocol or ACCOUNT_PROTOCOL)
 end
@@ -423,7 +572,7 @@ local function handleAccountData(senderId, message, protocol)
         else
             value = account.data and account.data[dataKey]
         end
-        return rednet.send(senderId, {
+        return networkSend(senderId, {
             type = "account_data", key = message.key, subkey = message.subkey,
             value = value, found = value ~= nil,
         }, protocol or ACCOUNT_PROTOCOL)
@@ -449,7 +598,7 @@ local function handleAccountData(senderId, message, protocol)
         account.data = previousData
         return sendError(senderId, ok and saveError or tostring(saved), protocol)
     end
-    rednet.send(senderId, { type = "account_data_saved", key = message.key, subkey = message.subkey },
+    networkSend(senderId, { type = "account_data_saved", key = message.key, subkey = message.subkey },
         protocol or ACCOUNT_PROTOCOL)
 end
 
@@ -465,7 +614,7 @@ local function handleAccountRequest(senderId, message, protocol)
     end
     if message.type == "logout" then
         sessions[senderId] = nil
-        return rednet.send(senderId, { type = "logged_out" }, protocol or ACCOUNT_PROTOCOL)
+        return networkSend(senderId, { type = "logged_out" }, protocol or ACCOUNT_PROTOCOL)
     end
     sendError(senderId, "The Rift account endpoint only accepts account requests.", protocol)
 end
@@ -636,9 +785,8 @@ local function drawDashboard()
 
     local endpointRow = width >= 40 and 9 or 12
     section(1, endpointRow, "NETWORK ENDPOINTS", width)
-    line(endpointRow + 1, " Login / rift-server  |  Jobs / rift-jobs", muted)
-    line(endpointRow + 2, " Market / rift-market  |  Mail / rift-mail", muted)
-    line(endpointRow + 3, " Casino / rift-casino", muted)
+    line(endpointRow + 1, " Server domain: " .. SERVER_DOMAIN, muted)
+    line(endpointRow + 2, " Services use separate protocols", muted)
 
     local activityRow = endpointRow + 5
     section(1, activityRow, "TRAFFIC", width)
@@ -832,11 +980,11 @@ local function drawMonitorDashboard(page, pageNumber, pageCount, rowsPerPage, bo
                 product.available and good or muted)
         end
     elseif page.type == "services" then
-        add("RIFT ACCOUNTS  |  " .. ACCOUNT_PROTOCOL .. " @ " .. LOGIN_SERVER_NAME, good)
-        add("RIFT JOBS  |  " .. PROTOCOL .. " @ " .. JOBS_SERVER_NAME, good)
-        add("RIFT MARKET  |  " .. MARKET_PROTOCOL .. " @ " .. MARKET_SERVER_NAME, good)
-        add("RIFT MAIL  |  " .. MAIL_PROTOCOL .. " @ " .. MAIL_SERVER_NAME, good)
-        add("RIFT CASINO  |  " .. CASINO_PROTOCOL .. " @ " .. CASINO_SERVER_NAME, good)
+        add("RIFT ACCOUNTS  |  " .. ACCOUNT_PROTOCOL .. " @ " .. SERVER_DOMAIN, good)
+        add("RIFT JOBS  |  " .. PROTOCOL .. " @ " .. SERVER_DOMAIN, good)
+        add("RIFT MARKET  |  " .. MARKET_PROTOCOL .. " @ " .. SERVER_DOMAIN, good)
+        add("RIFT MAIL  |  " .. MAIL_PROTOCOL .. " @ " .. SERVER_DOMAIN, good)
+        add("RIFT CASINO  |  " .. CASINO_PROTOCOL .. " @ " .. SERVER_DOMAIN, good)
         add("REQUESTS  |  Login " .. requestsByService.login .. "  /  Jobs "
             .. requestsByService.jobs .. "  /  Market " .. requestsByService.market, muted)
         add("REQUESTS  |  Mail " .. requestsByService.mail .. "  /  Casino "
@@ -928,8 +1076,10 @@ local function drawMonitorDashboards()
     end
 end
 
+logEvent("STARTUP", "Starting Rift server")
 openModems()
 
+logEvent("STARTUP", "Loading Market service")
 local marketServerPath = fs.combine(fs.getDir(shell.getRunningProgram()), "rift-server-market.lua")
 local marketServerChunk, marketLoadError = loadfile(marketServerPath)
 if not marketServerChunk then
@@ -942,7 +1092,7 @@ if not moduleLoaded or type(createMarketServer) ~= "function" then
 end
 handleMarketRequest, getMarketDashboardStats, cleanupMarketOrders = createMarketServer(function(senderId)
     return sessions[senderId]
-end)
+end, networkSend)
 if type(handleMarketRequest) ~= "function" then
     error("The Market server module did not provide a request handler.", 0)
 end
@@ -952,10 +1102,13 @@ end
 if type(cleanupMarketOrders) ~= "function" then
     error("The Market server module did not provide an order cleanup handler.", 0)
 end
+logEvent("SERVICE READY", "Market")
 
+logEvent("STARTUP", "Loading Jobs and account state")
 local legacyAccountsEmbedded
 state, legacyAccountsEmbedded = loadState()
 persistAccountMigration(legacyAccountsEmbedded)
+logEvent("STARTUP", "Loading Jobs service")
 local jobsServerPath = fs.combine(fs.getDir(shell.getRunningProgram()), "rift-server-jobs.lua")
 local jobsServerChunk, jobsLoadError = loadfile(jobsServerPath)
 if not jobsServerChunk then
@@ -973,6 +1126,8 @@ end
 if type(cleanupJobs) ~= "function" then
     error("The Jobs module did not provide a cleanup handler.", 0)
 end
+logEvent("SERVICE READY", "Jobs and accounts")
+logEvent("STARTUP", "Loading Mail service")
 local mailServerPath = fs.combine(fs.getDir(shell.getRunningProgram()), "rift-server-email.lua")
 local mailServerChunk, mailLoadError = loadfile(mailServerPath)
 if not mailServerChunk then
@@ -990,6 +1145,8 @@ end)
 if type(handleMailRequest) ~= "function" or type(getMailStats) ~= "function" then
     error("The Rift Mail server module did not provide its required handlers.", 0)
 end
+logEvent("SERVICE READY", "Mail")
+logEvent("STARTUP", "Loading Casino service")
 local casinoServerPath = fs.combine(fs.getDir(shell.getRunningProgram()), "rift-server-casino.lua")
 local casinoServerChunk, casinoLoadError = loadfile(casinoServerPath)
 if not casinoServerChunk then
@@ -1004,23 +1161,29 @@ handleCasinoRequest, getCasinoStats = createCasinoServer()
 if type(handleCasinoRequest) ~= "function" or type(getCasinoStats) ~= "function" then
     error("The Rift Casino server module did not provide its required handlers.", 0)
 end
-rednet.host(PROTOCOL, JOBS_SERVER_NAME)
-rednet.host(ACCOUNT_PROTOCOL, LOGIN_SERVER_NAME)
-rednet.host(MARKET_PROTOCOL, MARKET_SERVER_NAME)
-rednet.host(MAIL_PROTOCOL, MAIL_SERVER_NAME)
-rednet.host(CASINO_PROTOCOL, CASINO_SERVER_NAME)
-drawServerStatus()
-drawMonitorDashboards()
-
+logEvent("SERVICE READY", "Casino")
+local function serveRequests()
+local previousCleanupError
 while true do
-    local senderId, message, receivedProtocol = rednet.receive(nil, 1)
+    local senderId, message, receivedProtocol = networkReceive(1)
     local jobsCleaned, cleanupError = cleanupJobs()
-    if not jobsCleaned then lastRequest = "Jobs cleanup failed: " .. tostring(cleanupError) end
+    if not jobsCleaned then
+        lastRequest = "Jobs cleanup failed: " .. tostring(cleanupError)
+        local currentError = tostring(cleanupError)
+        if currentError ~= previousCleanupError then
+            logEvent("CLEANUP FAILED", "Jobs: " .. logValue(currentError))
+        end
+        previousCleanupError = currentError
+    elseif previousCleanupError then
+        logEvent("CLEANUP RECOVERED", "Jobs")
+        previousCleanupError = nil
+    end
     local knownProtocol = receivedProtocol == ACCOUNT_PROTOCOL or receivedProtocol == PROTOCOL
         or receivedProtocol == MARKET_PROTOCOL or receivedProtocol == MAIL_PROTOCOL
         or receivedProtocol == CASINO_PROTOCOL
-    if senderId and knownProtocol and (rateLimited(requestLimits, senderId, 60, 10)
-        or not recordRate(requestLimits, senderId, 10)) then
+    if senderId and knownProtocol and (rateLimited(requestLimits, senderRoutes[senderId].address, 60, 10)
+        or not recordRate(requestLimits, senderRoutes[senderId].address, 10)) then
+        logEvent("RATE LIMITED", logValue(senderRoutes[senderId].address))
         sendError(senderId, "Too many requests. Try again later.", receivedProtocol)
     elseif senderId and receivedProtocol == ACCOUNT_PROTOCOL then
         requestsByService.login = requestsByService.login + 1
@@ -1045,7 +1208,7 @@ while true do
             else
                 response = handleJobsRequest(senderId, username, message)
             end
-            rednet.send(senderId, response, PROTOCOL)
+            networkSend(senderId, response, PROTOCOL)
         end
     elseif senderId and receivedProtocol == MARKET_PROTOCOL then
         requestsByService.market = requestsByService.market + 1
@@ -1063,7 +1226,7 @@ while true do
         else
             response = handleMailRequest(username, message)
         end
-        rednet.send(senderId, response, MAIL_PROTOCOL)
+        networkSend(senderId, response, MAIL_PROTOCOL)
     elseif senderId and receivedProtocol == CASINO_PROTOCOL then
         requestsByService.casino = requestsByService.casino + 1
         lastRequest = "Rift Casino from #" .. senderId .. "  /  "
@@ -1075,9 +1238,25 @@ while true do
         else
             response = handleCasinoRequest(username, message)
         end
-        rednet.send(senderId, response, CASINO_PROTOCOL)
+        networkSend(senderId, response, CASINO_PROTOCOL)
     end
-    cleanupMarketOrders()
-    drawServerStatus()
-    drawMonitorDashboards()
+    if senderId then senderRoutes[senderId] = nil end
+    if cleanupMarketOrders() then logEvent("CLEANUP", "Removed expired Market orders") end
 end
+end
+
+local ok, serverError = pcall(function()
+    if peripheral.find("wifi_router") then
+        if type(serverWifi.run) ~= "function" then error("The Wi-Fi module cannot run a router bridge.", 0) end
+        logEvent("SERVER READY", "Listening for requests with router bridge")
+        parallel.waitForAny(serveRequests, serverWifi.run)
+    else
+        logEvent("SERVER READY", "Listening for requests")
+        serveRequests()
+    end
+end)
+if not ok then
+    logEvent("SERVER STOPPED", logValue(tostring(serverError)))
+    error(serverError, 0)
+end
+logEvent("SERVER STOPPED", "Router bridge stopped")

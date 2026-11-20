@@ -6,7 +6,8 @@ local PRODUCTS_FILE = "products.db"
 local PRODUCTS_BACKUP_FILE = "products.db.bak"
 local PRODUCTS_TEMP_FILE = "products.db.tmp"
 local TERMINAL_ORDER_RETENTION = 3 * 60 * 60 * 1000
-local function createMarketServer(getAuthenticatedUser)
+local function createMarketServer(getAuthenticatedUser, sendMessage)
+if type(sendMessage) ~= "function" then error("The market server requires the Wi-Fi network sender.") end
 local state
 
 local ALLOWED_TRANSITIONS = {
@@ -168,7 +169,7 @@ local function saveState()
 end
 
 local function sendError(senderId, message)
-    rednet.send(senderId, { type = "error", message = message }, PROTOCOL)
+    sendMessage(senderId, { type = "error", message = message }, PROTOCOL)
 end
 
 local function findOrder(orderId)
@@ -303,7 +304,7 @@ local function createOrder(senderId, username, message)
     state.nextId = math.max(state.nextId or 1, orderId + 1)
     table.insert(state.orders, order)
     saveState()
-    rednet.send(senderId, { type = "order_created", order = order }, PROTOCOL)
+    sendMessage(senderId, { type = "order_created", order = order }, PROTOCOL)
 end
 
 local function getOrder(senderId, username, message)
@@ -321,7 +322,7 @@ local function getOrder(senderId, username, message)
     orderCopy.providerAddress = orderCopy.providerAddress
         or state.providerAddresses[order.providerUser or ""]
         or state.providerAddresses[tostring(order.providerId)]
-    rednet.send(senderId, { type = "order_status", order = orderCopy }, PROTOCOL)
+    sendMessage(senderId, { type = "order_status", order = orderCopy }, PROTOCOL)
 end
 
 local function completeOrder(senderId, username, message)
@@ -340,7 +341,7 @@ local function completeOrder(senderId, username, message)
     order.status = "completed"
     order.updatedAt = os.epoch("utc")
     saveState()
-    rednet.send(senderId, { type = "order_completed", order = order }, PROTOCOL)
+    sendMessage(senderId, { type = "order_completed", order = order }, PROTOCOL)
 end
 
 local function listCustomerOrders(senderId, username)
@@ -359,7 +360,7 @@ local function listCustomerOrders(senderId, username)
     table.sort(orders, function(first, second)
         return (first.createdAt or 0) > (second.createdAt or 0)
     end)
-    rednet.send(senderId, { type = "customer_orders", orders = orders }, PROTOCOL)
+    sendMessage(senderId, { type = "customer_orders", orders = orders }, PROTOCOL)
 end
 
 local function listOrders(senderId, username)
@@ -375,7 +376,7 @@ local function listOrders(senderId, username)
             table.insert(active, orderCopy)
         end
     end
-    rednet.send(senderId, { type = "provider_orders", orders = active }, PROTOCOL)
+    sendMessage(senderId, { type = "provider_orders", orders = active }, PROTOCOL)
 end
 
 local function setProviderAddress(senderId, username, message)
@@ -394,7 +395,7 @@ local function setProviderAddress(senderId, username, message)
         end
     end
     saveState()
-    rednet.send(senderId, { type = "provider_address_saved", address = address }, PROTOCOL)
+    sendMessage(senderId, { type = "provider_address_saved", address = address }, PROTOCOL)
 end
 
 local function getCatalog(senderId)
@@ -402,7 +403,7 @@ local function getCatalog(senderId)
     for _, product in ipairs(state.products) do
         if product.available then table.insert(available, product) end
     end
-    rednet.send(senderId, { type = "catalog", products = available }, PROTOCOL)
+    sendMessage(senderId, { type = "catalog", products = available }, PROTOCOL)
 end
 
 local function listProviderProducts(senderId, username)
@@ -412,7 +413,7 @@ local function listProviderProducts(senderId, username)
             table.insert(products, product)
         end
     end
-    rednet.send(senderId, { type = "provider_products", products = products }, PROTOCOL)
+    sendMessage(senderId, { type = "provider_products", products = products }, PROTOCOL)
 end
 
 local function publishProduct(senderId, username, message)
@@ -467,7 +468,7 @@ local function publishProduct(senderId, username, message)
     product.providerAddress = providerAddress
     product.updatedAt = os.epoch("utc")
     saveState()
-    rednet.send(senderId, { type = "product_saved", product = product }, PROTOCOL)
+    sendMessage(senderId, { type = "product_saved", product = product }, PROTOCOL)
 end
 
 local function updateOrder(senderId, username, message)
@@ -485,7 +486,7 @@ local function updateOrder(senderId, username, message)
     order.status = message.status
     order.updatedAt = os.epoch("utc")
     saveState()
-    rednet.send(senderId, { type = "status_updated", order = order }, PROTOCOL)
+    sendMessage(senderId, { type = "status_updated", order = order }, PROTOCOL)
 end
 
 local function getDashboardStats()

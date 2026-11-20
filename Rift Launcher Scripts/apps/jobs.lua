@@ -1,11 +1,11 @@
 local PROTOCOL = "rift_jobs_v1"
 local TIMEOUT = 5
 local playerName
-if type(rift) ~= "table" or type(rift.account) ~= "table" then
-    error("This version of Rift Launcher does not support Rift accounts. Update the launcher.")
+if type(rift) ~= "table" or type(rift.account) ~= "table" or type(rift.cache) ~= "function" then
+    error("This version of Rift Launcher does not support Jobs caching. Update the launcher.")
 end
 
-
+local cache = rift.cache(300)
 
 local themes = {
     { accent = colors.cyan, highlight = colors.blue },
@@ -229,34 +229,53 @@ local function confirm(title, message)
 end
 
 local function openModems()
-    local found = false
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "modem" then
-            if not rednet.isOpen(name) then rednet.open(name) end
-            found = true
+    local address = type(wifi) == "table" and wifi.getIP()
+    if type(address) ~= "string" or address == "" then
+        error("Connect the launcher to Wi-Fi before starting Rift Jobs.")
+    end
+end
+
+local function requestServer(message)
+    message.riftService = PROTOCOL
+    message.riftSession = rift.networkSession
+    local sent, sendError = wifi.send("rift.local", message)
+    if not sent then return nil, sendError or "Could not send to the Jobs server." end
+    local deadline = os.clock() + TIMEOUT
+    while os.clock() < deadline do
+        local packet = wifi.receive(deadline - os.clock())
+        if not packet then break end
+        local response = type(packet) == "table" and packet.message
+        if type(response) == "table" and response.riftService == PROTOCOL
+            and response.riftSession == rift.networkSession then
+            if response.type == "error" then
+                return nil, response.message or "The Jobs server rejected the request."
+            end
+            return response
         end
     end
-    if not found then error("Attach a modem before starting Rift Jobs.") end
+    return nil, "No response from the Jobs server."
 end
 
 local function request(message)
-    local protocol = PROTOCOL
-    local serverId = rednet.lookup(protocol, "rift-jobs")
-    if not serverId then
-        return nil, "Rift Jobs server not found. Check that it is running and connected."
+    if message.type == "list_jobs" or message.type == "my_jobs" then
+        return cache.get(message.type, function()
+            local response, err = requestServer(message)
+            if not response then return nil, err end
+            if type(response.jobs) ~= "table" then return nil, "The Jobs server returned an invalid job list." end
+            return response
+        end)
     end
-    rednet.send(serverId, message, protocol)
-    local _, response = rednet.receive(protocol, TIMEOUT, serverId)
-    if type(response) ~= "table" then return nil, "No response from the Jobs server." end
-    if response.type == "error" then
-        return nil, response.message or "The Jobs server rejected the request."
-    end
-    return response
+    local mutation = message.type ~= "jobs_capabilities"
+    if mutation then cache.clear() end
+    local response, err = requestServer(message)
+    if mutation then cache.clear() end
+    return response, err
 end
 
 local function signOut()
     local ok, logoutError = rift.account.logout()
     playerName = nil
+    cache.clear()
     if not ok then return showNotice("SIGNED OUT", tostring(logoutError)) end
 end
 
@@ -354,6 +373,7 @@ local function browseJobs()
         elseif choice == "previous" then
             page = math.max(page - 1, 1)
         elseif choice == "refresh" then
+            cache.invalidate("list_jobs")
             page = 1
         elseif choice == "back" then
             return
@@ -475,6 +495,7 @@ local function myJobs()
         elseif choice == "previous" then
             page = math.max(page - 1, 1)
         elseif choice == "refresh" then
+            cache.invalidate("my_jobs")
             page = 1
         elseif choice == "back" then
             return

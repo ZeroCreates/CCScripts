@@ -1,6 +1,6 @@
 local HOST_BASE_URL = "https://rift.zerocreates.org/"
 local CASINO_PROTOCOL = "rift_casino_wallet_v1"
-local CASINO_SERVER = "rift-casino"
+local CASINO_SERVER = "rift.local"
 local TIMEOUT = 5
 local transactionSequence = 0
 if type(rift) ~= "table" or type(rift.account) ~= "table" then
@@ -134,18 +134,26 @@ local function nextRequestId()
 end
 
 local function serverRequest(message)
-    local serverId = rednet.lookup(CASINO_PROTOCOL, CASINO_SERVER)
-    if not serverId then return nil, "Rift Casino is offline. Start the combined Rift Server." end
+    message.riftService = CASINO_PROTOCOL
+    message.riftSession = rift.networkSession
     message.requestId = message.requestId or nextRequestId()
     for _ = 1, 2 do
-        rednet.send(serverId, message, CASINO_PROTOCOL)
-        local _, response = rednet.receive(CASINO_PROTOCOL, TIMEOUT, serverId)
-        if type(response) == "table"
-            and (response.requestId == nil or response.requestId == message.requestId) then
             if response.type == "error" then
-                return nil, response.message or "Casino server rejected the request."
+        local sent, sendError = wifi.send(CASINO_SERVER, message)
+        if not sent then return nil, sendError or "Could not send to Rift Casino." end
+        local deadline = os.clock() + TIMEOUT
+        while os.clock() < deadline do
+            local packet = wifi.receive(deadline - os.clock())
+            if not packet then break end
+            local response = type(packet) == "table" and packet.message
+            if type(response) == "table" and response.riftService == CASINO_PROTOCOL
+                and response.riftSession == rift.networkSession
+                and (response.requestId == nil or response.requestId == message.requestId) then
+                if response.type == "error" then
+                    return nil, response.message or "Casino server rejected the request."
+                end
+                return response
             end
-            return response
         end
     end
     return nil, "No matching response from the Casino server."
@@ -160,14 +168,8 @@ function walletApi.transact(action, amount, requestId)
 end
 
 local function openModems()
-    local found = false
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "modem" then
-            if not rednet.isOpen(name) then rednet.open(name) end
-            found = true
-        end
-    end
-    return found
+    local address = type(wifi) == "table" and wifi.getIP()
+    return type(address) == "string" and address ~= ""
 end
 
 local function requireSignIn()
@@ -326,7 +328,7 @@ local function startModemsAndInstall()
 end
 
 local requestedGame = select(1, ...)
-if not openModems() then error("Attach a modem before starting Rift Casino.") end
+if not openModems() then error("Connect the launcher to Wi-Fi before starting Rift Casino.") end
 if rift.account.saved() then
     local ok, result = rift.account.auto()
     if ok then account = { username = result } end

@@ -1,5 +1,5 @@
 local PROTOCOL = "order_system_v1"
-local SERVER_NAME = "rift-market"
+local SERVER_NAME = "rift.local"
 local TIMEOUT = 5
 local USERDATA_FILE = "market-userdata.json"
 local USERDATA_FILE_STORED = "market/"..USERDATA_FILE
@@ -9,10 +9,12 @@ if not storageLoaded or type(storage) ~= "table"
     or type(storage.delete) ~= "function" then
     storage = nil
 end
-if type(rift) ~= "table" or type(rift.account) ~= "table" then
-    error("This version of Rift Launcher does not support Rift accounts. Update the launcher.")
+if type(rift) ~= "table" or type(rift.account) ~= "table" or type(rift.cache) ~= "function" then
+    error("This version of Rift Launcher does not support Market caching. Update the launcher.")
 end
 
+local CACHE_SECONDS = 300
+local cache = rift.cache(CACHE_SECONDS)
 local mouseEnabled = false
 local userData = {}
 local riftAccount = {}
@@ -164,14 +166,10 @@ local function showNotice(title, message)
 end
 
 local function openModems()
-    local found = false
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "modem" then
-            if not rednet.isOpen(name) then rednet.open(name) end
-            found = true
-        end
+    local address = type(wifi) == "table" and wifi.getIP()
+    if type(address) ~= "string" or address == "" then
+        error("Connect the launcher to Wi-Fi before starting the ordering page.")
     end
-    if not found then error("Attach a modem before starting the ordering page.") end
     mouseEnabled = term.isColor()
 end
 
@@ -237,18 +235,49 @@ local function saveUserData()
     file.close()
     return true
 end
+local function requestServer(message)
+    message.riftService = PROTOCOL
+    message.riftSession = rift.networkSession
+    local sent, sendError = wifi.send(SERVER_NAME, message)
+    if not sent then return nil, sendError or "Could not send to the order server." end
+    local deadline = os.clock() + TIMEOUT
+    while os.clock() < deadline do
+        local packet = wifi.receive(deadline - os.clock())
+        if not packet then break end
+        local response = type(packet) == "table" and packet.message
+        if type(response) == "table" and response.riftService == PROTOCOL
+            and response.riftSession == rift.networkSession then
+            if response.type == "error" then
+                return nil, response.message or "The server rejected the request."
+            end
+            return response
+        end
+    end
+    return nil, "No response from the order server."
+end
+
 local function request(message)
-    local serverId = rednet.lookup(PROTOCOL, SERVER_NAME)
-    if not serverId then
-        return nil, "Order server not found. Check that it is running and connected."
+    local fields = { get_catalog = "products", my_orders = "orders" }
+    local field = fields[message.type]
+    if field then
+        return cache.get(message.type, function()
+            local response, err = requestServer(message)
+            if not response then return nil, err end
+            if type(response[field]) ~= "table" then return nil, "The order server returned invalid " .. field .. "." end
+            return response
+        end)
     end
-    rednet.send(serverId, message, PROTOCOL)
-    local _, response = rednet.receive(PROTOCOL, TIMEOUT)
-    if type(response) ~= "table" then return nil, "No response from the order server." end
-    if response.type == "error" then
-        return nil, response.message or "The server rejected the request."
+    local changesOrders = message.type == "place_order" or message.type == "complete_order"
+    if changesOrders then
+        cache.invalidate("my_orders")
+        cache.invalidate("get_catalog")
     end
-    return response
+    local response, err = requestServer(message)
+    if changesOrders then
+        cache.invalidate("my_orders")
+        cache.invalidate("get_catalog")
+    end
+    return response, err
 end
 
 local function loadRiftAccount(username)
@@ -261,6 +290,8 @@ end
 local function signOutRiftAccount()
     local ok, err = rift.account.logout()
     riftAccount = {}
+    cache.clear()
+    if rift.service and rift.service.stop then rift.service.stop("rift-market-notify") end
     if not ok then
         return false, tostring(err) .. " Saved credentials were cleared on this computer."
     end
@@ -825,16 +856,19 @@ end
 openModems()
 
 -- Polls order statuses from a background service and raises launcher notifications.
-local POLL_SECONDS = 60
+local POLL_SECONDS = CACHE_SECONDS
 local polling
 local knownStatus, firstPoll = {}, true
+local pollError
 
 local function checkOrders()
     if polling or type(rift) ~= "table" or type(rift.notify) ~= "function" then return end
+    if rift.account.current() ~= rift.account.sessionUser() or not rift.account.current() then return end
     polling = true
-    pcall(function()
-        local response = request({ type = "my_orders" })
-        if not response or type(response.orders) ~= "table" then return end
+    if not firstPoll then cache.invalidate("my_orders") end
+    local response, err = request({ type = "my_orders" })
+    if response then
+        pollError = false
         for _, order in ipairs(response.orders) do
             local status = tostring(order.status)
             if not firstPoll and knownStatus[order.id] ~= status then
@@ -843,7 +877,10 @@ local function checkOrders()
             knownStatus[order.id] = status
         end
         firstPoll = false
-    end)
+    elseif not pollError then
+        pollError = true
+        rift.notify("Rift Market notification check failed: " .. tostring(err))
+    end
     polling = false
 end
 
@@ -851,7 +888,13 @@ end
 if type(rift) == "table" and type(rift.service) == "table" and rift.service.persistInit then
     rift.service.persistInit("rift-market-notify", function()
         sleep(5)
-        pcall(rift.account.auto)
+        if not rift.account.current() then
+            local ok, err = rift.account.auto()
+            if not ok then
+                rift.notify("Rift Market notifications could not sign in: " .. tostring(err))
+                return
+            end
+        end
         while true do
             checkOrders()
             sleep(POLL_SECONDS)
@@ -902,6 +945,8 @@ while true do
     elseif choice == "v" then
         page = math.max(1, page - 1)
     elseif choice == "r" then
+        cache.invalidate("get_catalog")
+        cache.invalidate("my_orders")
         page = 1
     elseif choice == "q" then
         break

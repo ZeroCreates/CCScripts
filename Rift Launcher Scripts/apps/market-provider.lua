@@ -1,14 +1,16 @@
 local PROTOCOL = "order_system_v1"
-local SERVER_NAME = "rift-market"
+local SERVER_NAME = "rift.local"
 local TIMEOUT = 5
 local ADDRESS_FILE = "provider-address.cfg"
 local providerAddress
 local providerAddressRegistered = false
 local riftAccount = {}
-if type(rift) ~= "table" or type(rift.account) ~= "table" then
-    error("This version of Rift Launcher does not support Rift accounts. Update the launcher.")
+if type(rift) ~= "table" or type(rift.account) ~= "table" or type(rift.cache) ~= "function" then
+    error("This version of Rift Launcher does not support Market caching. Update the launcher.")
 end
 
+local CACHE_SECONDS = 300
+local cache = rift.cache(CACHE_SECONDS)
 local NEXT_STATUSES = {
     waiting = { "preparing", "cancelled" },
     preparing = { "completed", "cancelled" },
@@ -93,40 +95,65 @@ local function readChoice(help)
 end
 
 local function showNotice(title, message)
-    drawHeader(title, "PROVIDER CONSOLE  /  REDNET ORDER SYSTEM")
+    drawHeader(title, "PROVIDER CONSOLE  /  RIFT WI-FI ORDER SYSTEM")
     writeAt(2, 5, message, colors.white)
     readChoice("ok continue")
 end
 
 local function openModems()
-    local found = false
+    local address = type(wifi) == "table" and wifi.getIP()
+    if type(address) ~= "string" or address == "" then
+        error("Connect the launcher to Wi-Fi before starting the provider page.")
+    end
     for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "modem" then
-            if not rednet.isOpen(name) then rednet.open(name) end
-            found = true
-        elseif peripheral.getType(name) == "monitor" and not orderMonitor then
+        if peripheral.getType(name) == "monitor" and not orderMonitor then
             orderMonitor = peripheral.wrap(name)
             if orderMonitor then orderMonitor.setTextScale(0.5) end
         end
     end
-    if not found then error("Attach a modem before starting the provider page.") end
     if not term.isColor() then
         error("Run the provider on an advanced computer with a mouse attached.")
     end
 end
 
+local function requestServer(message)
+    message.riftService = PROTOCOL
+    message.riftSession = rift.networkSession
+    local sent, sendError = wifi.send(SERVER_NAME, message)
+    if not sent then return nil, sendError or "Could not send to the order server." end
+    local deadline = os.clock() + TIMEOUT
+    while os.clock() < deadline do
+        local packet = wifi.receive(deadline - os.clock())
+        if not packet then break end
+        local response = type(packet) == "table" and packet.message
+        if type(response) == "table" and response.riftService == PROTOCOL
+            and response.riftSession == rift.networkSession then
+            if response.type == "error" then
+                return nil, response.message or "The server rejected the request."
+            end
+            return response
+        end
+    end
+    return nil, "No response from the order server."
+end
+
 local function request(message)
-    local serverId = rednet.lookup(PROTOCOL, SERVER_NAME)
-    if not serverId then
-        return nil, "Order server not found. Check that it is running and connected."
+    local fields = { provider_list = "orders", get_provider_products = "products" }
+    local field = fields[message.type]
+    if field then
+        return cache.get(message.type, function()
+            local response, err = requestServer(message)
+            if not response then return nil, err end
+            if type(response[field]) ~= "table" then return nil, "The order server returned invalid " .. field .. "." end
+            return response
+        end)
     end
-    rednet.send(serverId, message, PROTOCOL)
-    local _, response = rednet.receive(PROTOCOL, TIMEOUT)
-    if type(response) ~= "table" then return nil, "No response from the order server." end
-    if response.type == "error" then
-        return nil, response.message or "The server rejected the request."
-    end
-    return response
+    local invalidated = (message.type == "set_status" or message.type == "set_provider_address")
+        and "provider_list" or message.type == "publish_product" and "get_provider_products"
+    if invalidated then cache.invalidate(invalidated) end
+    local response, err = requestServer(message)
+    if invalidated then cache.invalidate(invalidated) end
+    return response, err
 end
 
 local function loadRiftAccount(username)
@@ -373,7 +400,7 @@ local function showOrders(orders, page, errorMessage)
 
     local visibleOrders = render()
     local buttons = drawChoices("p products|a address|r refresh|q quit")
-    local refreshTimer = os.startTimer(5)
+    local refreshTimer = os.startTimer(CACHE_SECONDS)
     while true do
         local event, eventId, x, y = os.pullEvent()
         if event == "timer" and eventId == refreshTimer then
@@ -387,7 +414,7 @@ local function showOrders(orders, page, errorMessage)
             drawOrderMonitor(orders, errorMessage)
             visibleOrders = render()
             buttons = drawChoices("p products|a address|r refresh|q quit")
-            refreshTimer = os.startTimer(5)
+            refreshTimer = os.startTimer(CACHE_SECONDS)
         elseif event == "mouse_click" and eventId == 1 then
             for _, choice in ipairs(buttons) do
                 if y == choice.row and x >= choice.left and x <= choice.right then
@@ -481,7 +508,7 @@ local function productPage(products, page, errorMessage)
         writeAt(2, height - 3, "PAGE " .. page .. " / " .. pageCount, colors.yellow)
     end
 
-    local buttons = drawChoices("a add|b back")
+    local buttons = drawChoices("a add|r refresh|b back")
     while true do
         local event, button, x, y = os.pullEvent()
         if event == "mouse_click" and button == 1 then
@@ -685,6 +712,9 @@ while true do
                 productPageNumber = productPageNumber + 1
             elseif productChoice == "v" then
                 productPageNumber = math.max(1, productPageNumber - 1)
+            elseif productChoice == "r" then
+                cache.invalidate("get_provider_products")
+                productPageNumber = 1
             elseif productChoice == "b" or productChoice == "q" then
                 break
             end
@@ -696,6 +726,7 @@ while true do
     elseif choice == "v" then
         orderPage = math.max(1, orderPage - 1)
     elseif choice == "r" then
+        cache.invalidate("provider_list")
         orderPage = 1
     elseif choice == "q" then
         break

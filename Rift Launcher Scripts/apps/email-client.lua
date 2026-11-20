@@ -1,11 +1,18 @@
 local PROTOCOL = "rift_mail_v1"
-local SERVER_NAME = "rift-mail"
+local SERVER_NAME = "rift.local"
 local TIMEOUT = 5
 local mouseEnabled = false
 local account
 local currentFolder = "Inbox"
 local themeAccent = colors.cyan
 local themeHighlight = colors.blue
+if type(rift) ~= "table" or type(rift.account) ~= "table" or type(rift.cache) ~= "function" then
+    error("This version of Rift Launcher does not support Mail caching. Update the launcher.")
+end
+local CACHE_SECONDS = 300
+local cache = rift.cache(CACHE_SECONDS)
+local serviceRequested = false
+local seenMail, firstPoll = {}, true
 
 if type(launcherTheme) == "table" then
     if type(launcherTheme.accent) == "number" then themeAccent = launcherTheme.accent end
@@ -110,29 +117,53 @@ local function readChoice(help)
 end
 
 local function openModems()
-    local found = false
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "modem" then
-            if not rednet.isOpen(name) then rednet.open(name) end
-            found = true
-        end
+    local address = type(wifi) == "table" and wifi.getIP()
+    if type(address) ~= "string" or address == "" then
+        error("Connect the launcher to Wi-Fi before starting the email client.")
     end
-    if not found then error("Attach a modem before starting the email client.") end
     mouseEnabled = term.isColor()
 end
 
+local function requestServer(payload)
+    payload.riftService = PROTOCOL
+    payload.riftSession = rift.networkSession
+    local sent, sendError = wifi.send(SERVER_NAME, payload)
+    if not sent then return nil, sendError or "Could not send to Rift Mail." end
+    local deadline = os.clock() + TIMEOUT
+    while os.clock() < deadline do
+        local packet = wifi.receive(deadline - os.clock())
+        if not packet then break end
+        local response = type(packet) == "table" and packet.message
+        if type(response) == "table" and response.riftService == PROTOCOL
+            and response.riftSession == rift.networkSession then
+            if response.type == "error" then
+                return nil, response.message or "Rift Mail rejected the request."
+            end
+            return response
+        end
+    end
+    return nil, "No response from Rift Mail."
+end
+
 local function request(payload)
-    local serverId = rednet.lookup(PROTOCOL, SERVER_NAME)
-    if not serverId then
-        return nil, "Rift server not found. Check that it is running and connected."
+    local field, key
+    if payload.type == "list" then
+        field, key = "messages", "list:" .. payload.category
+    elseif payload.type == "list_categories" then
+        field, key = "categories", "categories"
     end
-    rednet.send(serverId, payload, PROTOCOL)
-    local _, response = rednet.receive(PROTOCOL, TIMEOUT, serverId)
-    if type(response) ~= "table" then return nil, "No response from Rift Mail." end
-    if response.type == "error" then
-        return nil, response.message or "Rift Mail rejected the request."
+    if field then
+        return cache.get(key, function()
+            local response, err = requestServer(payload)
+            if not response then return nil, err end
+            if type(response[field]) ~= "table" then return nil, "Rift Mail returned invalid " .. field .. "." end
+            return response
+        end)
     end
-    return response
+    cache.clear()
+    local response, err = requestServer(payload)
+    cache.clear()
+    return response, err
 end
 
 local function choose(title, subtitle, choices)
@@ -214,6 +245,10 @@ local function signOut()
     local ok, err = rift.account.logout()
     account = nil
     currentFolder = "Inbox"
+    cache.clear()
+    seenMail, firstPoll = {}, true
+    serviceRequested = false
+    if rift.service and rift.service.stop then rift.service.stop("rift-mail-notify") end
     if not ok then notice("SIGN OUT", tostring(err)) end
     return ok
 end
@@ -330,6 +365,7 @@ local function folders()
         if page > 1 then table.insert(choices, { key = "previous", label = "Previous page" }) end
         if page < pageCount then table.insert(choices, { key = "next", label = "Next page" }) end
         table.insert(choices, { key = "create", label = "Create category" })
+        table.insert(choices, { key = "refresh", label = "Refresh folders" })
         table.insert(choices, { key = "back", label = "Back" })
         local selected = choose("RIFT MAIL FOLDERS", account.username, choices)
         if selected == "back" or not selected then return nil end
@@ -345,6 +381,8 @@ local function folders()
             else
                 notice("CREATE CATEGORY", "Created " .. created.category .. ".")
             end
+        elseif selected == "refresh" then
+            cache.invalidate("categories")
         elseif selected == "next" then
             page = math.min(pageCount, page + 1)
         elseif selected == "previous" then
@@ -391,7 +429,7 @@ local function inbox(category)
         writeAt(2, height - 4, "PAGE " .. page .. " / " .. pageCount, themeAccent)
         local help = (page > 1 and "v prev|" or "")
             .. (endIndex < #response.messages and "n next|" or "")
-            .. "i inbox|c compose|f folders|s sign out|q quit"
+            .. "i inbox|c compose|f folders|r refresh|s sign out|q quit"
         local selected
         if mouseEnabled then
             local buttons = drawChoices(help)
@@ -445,6 +483,10 @@ local function inbox(category)
         if selected == "c" then return "compose" end
         if selected == "f" then return "folder", folders() end
         if selected == "i" then return "folder", "Inbox" end
+        if selected == "r" then
+            cache.invalidate("list:" .. category)
+            return "folder", category
+        end
         if selected == "s" then return "signout" end
         if selected == "q" then return "quit" end
         if selected == "v" or selected == "p" then page = math.max(1, page - 1) end
@@ -559,9 +601,6 @@ local function compose()
 end
 
 openModems()
-if type(rift) ~= "table" or type(rift.account) ~= "table" then
-    error("This version of Rift Launcher does not support Rift accounts. Update the launcher.")
-end
 do
     local savedName = rift.account.saved()
     if savedName then
@@ -571,17 +610,18 @@ do
 end
 
 -- Polls for new mail from a background service and raises a launcher notification.
-local POLL_SECONDS = 60
+local POLL_SECONDS = CACHE_SECONDS
 local polling
-local seenMail, firstPoll = {}, true
-local serviceRequested = false
+local pollError
 
 local function checkMail()
     if polling or not account or type(rift) ~= "table" or type(rift.notify) ~= "function" then return end
+    if account.username ~= rift.account.sessionUser() then return end
     polling = true
-    pcall(function()
-        local response = request({ type = "list", category = "Inbox" })
-        if not response or type(response.messages) ~= "table" then return end
+    if not firstPoll then cache.invalidate("list:Inbox") end
+    local response, err = request({ type = "list", category = "Inbox" })
+    if response then
+        pollError = false
         local unread, newest = 0, nil
         for _, item in ipairs(response.messages) do
             if not item.read then
@@ -598,7 +638,10 @@ local function checkMail()
             rift.notify("New mail from " .. tostring(newest.from) .. ": " .. tostring(newest.subject))
         end
         firstPoll = false
-    end)
+    elseif not pollError then
+        pollError = true
+        rift.notify("Rift Mail notification check failed: " .. tostring(err))
+    end
     polling = false
 end
 
@@ -606,7 +649,14 @@ end
 if type(rift) == "table" and type(rift.service) == "table" and rift.service.persistInit then
     rift.service.persistInit("rift-mail-notify", function()
         sleep(5)
-        pcall(rift.account.auto)
+        if not rift.account.current() then
+            local ok, result = rift.account.auto()
+            if not ok then
+                rift.notify("Rift Mail notifications could not sign in: " .. tostring(result))
+                return
+            end
+            account = { username = result }
+        end
         while true do
             checkMail()
             sleep(POLL_SECONDS)
@@ -616,7 +666,15 @@ end
 
 while true do
     if account then
-        local signedIn, signInResult = rift.account.auto()
+        local signedIn, signInResult = true, account.username
+        if rift.account.current() ~= account.username then
+            signedIn, signInResult = rift.account.auto()
+            if signedIn and signInResult ~= account.username then
+                cache.clear()
+                seenMail, firstPoll = {}, true
+                account = { username = signInResult }
+            end
+        end
         local signInError = signInResult
         if signedIn and not serviceRequested and type(rift) == "table" and rift.service then
             serviceRequested = true

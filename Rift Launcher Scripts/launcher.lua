@@ -13,18 +13,235 @@ local nativeOs = os
 local nativeRequire = require
 local nativePullEvent = nativeOs.pullEvent
 local nativePullEventRaw = nativeOs.pullEventRaw
+local launcherThread = coroutine.running()
+local message = ""
+local recoverySession = false
 
-local function openWirelessRednetModems()
-    if type(peripheral) ~= "table" or type(rednet) ~= "table" then return end
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name) == "modem" then
-            local modem = peripheral.wrap(name)
-            if modem and type(modem.isWireless) == "function" and modem.isWireless()
-                and not rednet.isOpen(name) then
-                rednet.open(name)
+local riftWifiState = {
+    config = { ssid = "Rift", password = "" },
+    configPath = "/rift/network.json",
+    session = tostring(os.getComputerID()) .. "-" .. tostring(os.epoch("utc")),
+}
+local riftModules = { muted = {} }
+
+riftWifiState.saveConfig = function()
+    local serialized, contents = pcall(textutils.serializeJSON, riftWifiState.config)
+    if not serialized or type(contents) ~= "string" then return false, "Could not serialize Wi-Fi settings." end
+    local made, makeError = pcall(fs.makeDir, "/rift")
+    if not made then return false, "Could not create the Rift network folder: " .. tostring(makeError) end
+
+    local temporary, backup = riftWifiState.configPath .. ".tmp", riftWifiState.configPath .. ".bak"
+    if fs.exists(temporary) then fs.delete(temporary) end
+    if fs.exists(backup) then fs.delete(backup) end
+    local file, openError = fs.open(temporary, "w")
+    if not file then return false, "Could not create the Wi-Fi settings file: " .. tostring(openError) end
+    local wrote, writeError = pcall(file.write, contents)
+    local closed, closeError = pcall(file.close)
+    if not wrote or not closed then
+        fs.delete(temporary)
+        return false, "Could not save Wi-Fi settings: "
+            .. tostring(not wrote and writeError or closeError)
+    end
+    if fs.exists(riftWifiState.configPath) then
+        local backedUp, backupError = pcall(fs.move, riftWifiState.configPath, backup)
+        if not backedUp then
+            fs.delete(temporary)
+            return false, "Could not back up Wi-Fi settings: " .. tostring(backupError)
+        end
+    end
+    local moved, moveError = pcall(fs.move, temporary, riftWifiState.configPath)
+    if not moved then
+        fs.delete(temporary)
+        if fs.exists(backup) then pcall(fs.move, backup, riftWifiState.configPath) end
+        return false, "Could not save Wi-Fi settings: " .. tostring(moveError)
+    end
+    if fs.exists(backup) then fs.delete(backup) end
+    return true
+end
+
+riftWifiState.setup = function(options)
+    options = type(options) == "table" and options or {}
+    local ok, loaded = pcall(require, "wifi")
+    if not ok or type(loaded) ~= "table" then return false, "The wifi Lua module is not available." end
+    riftWifiState.api = loaded
+
+    local path = riftWifiState.configPath
+    if fs.exists(path) and not fs.isDir(path) then
+        local file = fs.open(path, "r")
+        if file then
+            local contents = file.readAll()
+            file.close()
+            local parsed, saved = pcall(textutils.unserializeJSON, contents)
+            if parsed and type(saved) == "table" then
+                if type(saved.ssid) == "string" and saved.ssid ~= "" then riftWifiState.config.ssid = saved.ssid end
+                if type(saved.password) == "string" then riftWifiState.config.password = saved.password end
             end
         end
     end
+    if type(options.ssid) == "string" and options.ssid ~= "" then riftWifiState.config.ssid = options.ssid end
+    if type(options.password) == "string" then riftWifiState.config.password = options.password end
+
+    local connected, reason = riftWifiState.api.connect(
+        riftWifiState.config.ssid, riftWifiState.config.password)
+    if not connected then return false, reason or "Could not connect to the Rift Wi-Fi router." end
+    return true
+end
+
+riftWifiState.module = function()
+    if riftWifiState.api then return riftWifiState.api end
+    local ok, api = pcall(nativeRequire, "wifi")
+    if ok and type(api) == "table" then
+        riftWifiState.api = api
+        return api
+    end
+end
+
+riftWifiState.isConnected = function()
+    local api = riftWifiState.module()
+    if not api then return false end
+    local address = api.getIP()
+    return type(address) == "string" and address ~= ""
+end
+
+riftWifiState.disconnect = function()
+    local api = riftWifiState.api
+    if not api then
+        local ok, loaded = pcall(require, "wifi")
+        if not ok or type(loaded) ~= "table" then
+            return false, "The wifi Lua module is not available."
+        end
+        api = loaded
+    end
+    local disconnect = api.disconnect
+    if type(disconnect) ~= "function" then
+        return false, "This Wi-Fi module does not support disconnecting."
+    end
+    local ok, result, reason = pcall(disconnect)
+    if not ok then return false, tostring(result) end
+    if result == false then return false, tostring(reason or "Could not disconnect from Wi-Fi.") end
+    for _, path in ipairs({
+        riftWifiState.configPath,
+        riftWifiState.configPath .. ".tmp",
+        riftWifiState.configPath .. ".bak",
+    }) do
+        if fs.exists(path) then
+            if fs.isDir(path) then
+                return false, "Disconnected, but could not delete saved Wi-Fi settings because "
+                    .. path .. " is a directory."
+            end
+            local deleted, deleteError = pcall(fs.delete, path)
+            if not deleted then
+                return false, "Disconnected, but could not delete saved Wi-Fi settings: "
+                    .. tostring(deleteError)
+            end
+        end
+    end
+    riftWifiState.config.ssid = "Rift"
+    riftWifiState.config.password = ""
+    return true
+end
+
+riftWifiState.toggle = function()
+    local changed, reason
+    if riftWifiState.isConnected() then
+        changed, reason = riftWifiState.disconnect()
+    elseif fs.exists(riftWifiState.configPath) then
+        changed, reason = riftWifiState.setup()
+        if not changed then
+            riftModules.ui().notice(
+                "Saved Wi-Fi connection failed: " .. tostring(reason or "unknown error"), "Wi-Fi")
+            return riftWifiState.prompt(true)
+        end
+    else
+        return riftWifiState.prompt(true)
+    end
+    if changed then
+        message = riftWifiState.isConnected() and "Wi-Fi connected: " .. riftWifiState.config.ssid
+            or "Wi-Fi disconnected."
+    else
+        message = tostring(reason or "Could not change the Wi-Fi connection.")
+    end
+    riftModules.ui().notice(message, "Wi-Fi")
+    return changed
+end
+
+riftWifiState.prompt = function(skipConfirmation)
+    if recoverySession then return false end
+    local wifiOk = pcall(require, "wifi")
+    if not wifiOk then return false end
+
+    local ui = riftModules.ui()
+    if riftWifiState.isConnected() then
+        return true
+    end
+    if not skipConfirmation and not ui.confirm("Connect this launcher to a Wi-Fi Router?", "Wi-Fi") then
+        message = "Wi-Fi connection skipped."
+        return false
+    end
+
+    local ssid = ui.input("Network SSID", {
+        title = "Wi-Fi",
+        default = riftWifiState.config.ssid,
+    })
+    if ssid == nil then
+        message = "Wi-Fi setup cancelled."
+        return false
+    end
+    ssid = ssid:gsub("^%s*(.-)%s*$", "%1")
+    if ssid == "" then
+        ui.notice("Enter a network SSID.", "Wi-Fi")
+        return false
+    end
+
+    local password = ui.input("Password (leave blank for an open network)", {
+        title = "Wi-Fi",
+        hidden = true,
+        default = riftWifiState.config.password,
+    })
+    if password == nil then
+        message = "Wi-Fi setup cancelled."
+        return false
+    end
+    if password ~= "" and (#password < 8 or #password > 63) then
+        ui.notice("Wi-Fi passwords must contain 8-63 characters.", "Wi-Fi")
+        return false
+    end
+
+    riftWifiState.config.ssid = ssid
+    riftWifiState.config.password = password
+    local saved, saveError = riftWifiState.saveConfig()
+    if not saved then
+        ui.notice(saveError or "Could not save Wi-Fi settings.", "Wi-Fi")
+        return false
+    end
+
+    local connected, connectError = riftWifiState.setup({
+        ssid = ssid,
+        password = password,
+    })
+    if connected then
+        ui.notice("Connected to Wi-Fi network \"" .. ssid .. "\".", "Wi-Fi")
+        message = "Wi-Fi connected: " .. ssid
+        return true
+    end
+    ui.notice(tostring(connectError or "Could not connect to the Wi-Fi router."), "Wi-Fi")
+    message = "Wi-Fi connection failed."
+    return false
+end
+
+riftWifiState.start = function()
+    if recoverySession then return false end
+    if not fs.exists(riftWifiState.configPath) or fs.isDir(riftWifiState.configPath) then
+        return riftWifiState.prompt()
+    end
+    local connected, connectError = riftWifiState.setup()
+    if connected then
+        message = "Wi-Fi connected: " .. riftWifiState.config.ssid
+        return true
+    end
+    riftModules.ui().notice(
+        "Saved Wi-Fi connection failed: " .. tostring(connectError or "unknown error"), "Wi-Fi")
+    return riftWifiState.prompt()
 end
 
 -- Black box recorder: every entry is appended and closed at once, so it survives crashes and reboots.
@@ -74,6 +291,10 @@ local function unfilteredPullEventRaw(filter)
 end
 -- Terminate never reaches the launcher; it opens the session menu instead.
 nativePullEventRaw = function(filter)
+    -- Leave the host event scheduler and rednet daemon free to process events.
+    if coroutine.running() ~= launcherThread and not inAppChain then
+        return rawPullEventRaw(filter)
+    end
     -- Inside the app's coroutine chain, yielding hands control back to the launcher's driver.
     -- Outside it (ComputerCraft's event pump), yielding would stall everything.
     local function abandonApp()
@@ -120,10 +341,8 @@ end
 local apps = {}
 local selected = 1
 local firstVisible = 1
-local message = ""
 local currentUser
 local homeDirectory
-local recoverySession = false
 local showRecoveryProfileInspector
 local profilePasswords = {}
 local profileAdmins = {}
@@ -146,8 +365,6 @@ local function playNotificationSound()
 end
 
 -- Shared state for rift.permissions, rift.account and notification muting; one table keeps top-level locals low.
-local riftModules = { muted = {} }
-
 local function notifyUser(text, options)
     options = type(options) == "table" and options or {}
     text = tostring(text):gsub("[%c]", " ")
@@ -248,7 +465,6 @@ local services = {
                 notifyUser("Disk removed (" .. tostring(event[2]) .. ").")
             elseif event[1] == "peripheral" or event[1] == "peripheral_detach" then
                 bootLog("PERIPHERAL " .. event[1] .. " " .. tostring(event[2]))
-                if event[1] == "peripheral" then openWirelessRednetModems() end
             elseif event[1] == "monitor_resize" or event[1] == "term_resize" then
                 bootLog("DISPLAY " .. event[1])
             end
@@ -1211,6 +1427,7 @@ local function createSystemEnvironment()
     local environment = {}
     for name, value in pairs(_ENV) do environment[name] = value end
     environment.launcherTheme = getThemeInfo()
+    environment.wifi = riftWifiState.module()
     return environment
 end
 
@@ -2713,6 +2930,7 @@ local function runHomeProgram(programPath, profileContext, ...)
         end
 
         local function migrateLegacyDirectory(directory, relativeDirectory)
+            local migration = {}
             if not nativeFs.exists(directory) then return end
             for _, name in ipairs(nativeFs.list(directory)) do
                 local path = nativeFs.combine(directory, name)
@@ -2738,38 +2956,40 @@ local function runHomeProgram(programPath, profileContext, ...)
                             error("Could not encrypt private storage file " .. relativePath
                                 .. ": " .. tostring(protectError), 0)
                         end
-                        local temporary, backup = path .. ".enc-tmp", path .. ".enc-bak"
-                        if nativeFs.exists(temporary) or nativeFs.exists(backup) then
+                        migration.temporary, migration.backup = path .. ".enc-tmp", path .. ".enc-bak"
+                        if nativeFs.exists(migration.temporary) or nativeFs.exists(migration.backup) then
                             error("Could not encrypt private storage file " .. relativePath
                                 .. ": an encryption recovery file already exists.", 0)
                         end
-                        local output = nativeFs.open(temporary, "w")
+                        local output = nativeFs.open(migration.temporary, "w")
                         if not output then
                             error("Could not create encryption staging file for " .. relativePath .. ".", 0)
                         end
-                        local wrote, writeError = pcall(output.write, protected)
-                        local closed, closeError = pcall(output.close)
-                        if not wrote or not closed then
-                            if nativeFs.exists(temporary) then nativeFs.delete(temporary) end
+                        migration.wrote, migration.writeError = pcall(output.write, protected)
+                        migration.closed, migration.closeError = pcall(output.close)
+                        if not migration.wrote or not migration.closed then
+                            if nativeFs.exists(migration.temporary) then nativeFs.delete(migration.temporary) end
                             error("Could not write encrypted storage file " .. relativePath .. ": "
-                                .. tostring(not wrote and writeError or closeError), 0)
+                                .. tostring(not migration.wrote and migration.writeError or migration.closeError), 0)
                         end
-                        local backedUp, backupError = pcall(nativeFs.move, path, backup)
-                        if not backedUp then
-                            nativeFs.delete(temporary)
+                        migration.backedUp, migration.backupError = pcall(nativeFs.move, path, migration.backup)
+                        if not migration.backedUp then
+                            nativeFs.delete(migration.temporary)
                             error("Could not back up private storage file " .. relativePath .. ": "
-                                .. tostring(backupError), 0)
+                                .. tostring(migration.backupError), 0)
                         end
-                        movedt, moveErrort = pcall(nativeFs.move, temporary, path)
-                        if not movedt then
-                            if nativeFs.exists(temporary) then nativeFs.delete(temporary) end
-                            restoredt, restoreErrort = pcall(nativeFs.move, backup, path)
+                        migration.moved, migration.moveError = pcall(
+                            nativeFs.move, migration.temporary, path)
+                        if not migration.moved then
+                            if nativeFs.exists(migration.temporary) then nativeFs.delete(migration.temporary) end
+                            migration.restored, migration.restoreError = pcall(
+                                nativeFs.move, migration.backup, path)
                             error("Could not install encrypted storage file " .. relativePath .. ": "
-                                .. tostring(moveErrort)
-                                .. (restoredt and "" or "; restoring the backup also failed: "
-                                    .. tostring(restoreErrort)), 0)
+                                .. tostring(migration.moveError)
+                                .. (migration.restored and "" or "; restoring the backup also failed: "
+                                    .. tostring(migration.restoreError)), 0)
                         end
-                        nativeFs.delete(backup)
+                        nativeFs.delete(migration.backup)
                     end
                 end
             end
@@ -2805,8 +3025,8 @@ local function runHomeProgram(programPath, profileContext, ...)
 
             local options = { "Home directory (H://)" }
             for _, mount in ipairs(mounts) do
-                local label = mount.kind == "hard_drive" and "Hard drive" or "Disk"
-                options[#options + 1] = label .. " (" .. mount.alias .. ")"
+                options[#options + 1] = (mount.kind == "hard_drive" and "Hard drive" or "Disk")
+                    .. " (" .. mount.alias .. ")"
             end
             local choice = riftModules.ui().menu("Choose save location", options)
             if not choice then return nil end
@@ -2935,22 +3155,23 @@ local function runHomeProgram(programPath, profileContext, ...)
                     end
                     return results
                 end
-                local targetUsername = normalizedPattern:match("^users/([%w_-]+)/")
+                local match = {}
+                match.username = normalizedPattern:match("^users/([%w_-]+)/")
                     or normalizedPattern:match("^users/([%w_-]+)$")
-                local physicalProfileRoot = targetUsername
-                    and nativeFs.combine(USER_ROOT, targetUsername)
-                local target = physicalPath(pattern)
-                if not target then return nil end
-                for _, found in ipairs(nativeFs.find(target)) do
-                    local normalizedFound = found:gsub("^/+", "")
-                    if normalizedFound == physicalHome then
+                match.profileRoot = match.username and nativeFs.combine(USER_ROOT, match.username)
+                match.target = physicalPath(pattern)
+                if not match.target then return nil end
+                for _, found in ipairs(nativeFs.find(match.target)) do
+                    match.normalizedFound = found:gsub("^/+", "")
+                    if match.normalizedFound == physicalHome then
                         table.insert(results, "/")
-                    elseif normalizedFound:sub(1, #physicalHome + 1) == physicalHome .. "/" then
-                        table.insert(results, "/" .. normalizedFound:sub(#physicalHome + 2))
-                    elseif physicalProfileRoot
-                        and (normalizedFound == physicalProfileRoot
-                            or normalizedFound:sub(1, #physicalProfileRoot + 1) == physicalProfileRoot .. "/") then
-                        table.insert(results, "/" .. normalizedFound)
+                    elseif match.normalizedFound:sub(1, #physicalHome + 1) == physicalHome .. "/" then
+                        table.insert(results, "/" .. match.normalizedFound:sub(#physicalHome + 2))
+                    elseif match.profileRoot
+                        and (match.normalizedFound == match.profileRoot
+                            or match.normalizedFound:sub(1, #match.profileRoot + 1)
+                                == match.profileRoot .. "/") then
+                        table.insert(results, "/" .. match.normalizedFound)
                     end
                 end
                 return results
@@ -2958,8 +3179,8 @@ local function runHomeProgram(programPath, profileContext, ...)
         end
         if type(nativeFs.complete) == "function" then
             sandboxFs.complete = function(path, location, includeFiles, includeDirs)
-                local normalized = normalizeVirtualPath(path)
-                local alias, aliasPath = normalized:match("^([%w@#?]+://)(.*)$")
+                local completion = { normalized = normalizeVirtualPath(path) }
+                local alias, aliasPath = completion.normalized:match("^([%w@#?]+://)(.*)$")
                 local pathForParts = alias and aliasPath or path
                 local pathDirectory = nativeFs.getDir(pathForParts)
                 local name = nativeFs.getName(pathForParts)
@@ -2972,23 +3193,23 @@ local function runHomeProgram(programPath, profileContext, ...)
                         baseDirectory .. (pathDirectory ~= "" and "/" .. pathDirectory or "")
                     )
                 end
-                local physicalDirectory = physicalPath(baseDirectory)
-                if not physicalDirectory then return nil end
-                local completions = nativeFs.complete(
+                completion.directory = physicalPath(baseDirectory)
+                if not completion.directory then return nil end
+                completion.items = nativeFs.complete(
                     name,
-                    physicalDirectory,
+                    completion.directory,
                     includeFiles,
                     includeDirs
                 )
-                local prefix = pathDirectory ~= "" and pathDirectory .. "/" or ""
-                local result = {}
-                for _, completion in ipairs(completions) do
-                    local completedPhysical = nativeFs.combine(physicalDirectory, completion)
-                    if not isRecoveryProtectedPath(completedPhysical) then
-                        table.insert(result, (alias or "") .. prefix .. completion)
+                completion.prefix = pathDirectory ~= "" and pathDirectory .. "/" or ""
+                completion.result = {}
+                for _, item in ipairs(completion.items) do
+                    completion.physical = nativeFs.combine(completion.directory, item)
+                    if not isRecoveryProtectedPath(completion.physical) then
+                        table.insert(completion.result, (alias or "") .. completion.prefix .. item)
                     end
                 end
-                return result
+                return completion.result
             end
         end
 
@@ -3061,6 +3282,8 @@ local function runHomeProgram(programPath, profileContext, ...)
         end
         sandboxRift.ui = riftModules.ui()
         sandboxRift.account = riftModules.account(storageModule, sandboxRift.ui)
+        sandboxRift.cache = riftModules.cache
+        sandboxRift.networkSession = riftWifiState.session
         sandboxRift.permissions = {
             has = function(capability)
                 local key = tostring(currentUser) .. ":cap:" .. tostring(capability)
@@ -3076,6 +3299,7 @@ local function runHomeProgram(programPath, profileContext, ...)
         environment.peripheral = riftModules.peripheral()
         environment.rift = sandboxRift
         environment.storage = sandboxRift.storage
+        environment.wifi = riftWifiState.module()
         environment._G = environment
         environment.debug = nil
         environment.package = packageState
@@ -3608,6 +3832,43 @@ riftModules.list = function()
     return result
 end
 
+-- Per-app, in-memory cache. Failed loads and invalidated in-flight loads are not cached.
+riftModules.cache = function(ttl)
+    if type(ttl) ~= "number" or ttl <= 0 then error("Cache lifetime must be positive.", 2) end
+    local entries, generation = {}, 0
+    local accountRevision = riftModules.accountRevision or 0
+    local function checkAccount()
+        local current = riftModules.accountRevision or 0
+        if current ~= accountRevision then
+            entries, generation, accountRevision = {}, generation + 1, current
+        end
+    end
+    return {
+        get = function(key, load)
+            checkAccount()
+            local entry = entries[key]
+            local now = os.clock()
+            if entry and now >= entry.time and now - entry.time < ttl then return entry.value end
+            entries[key] = nil
+            local started = generation
+            local value, err = load()
+            checkAccount()
+            if value ~= nil and generation == started then
+                entries[key] = { value = value, time = os.clock() }
+            end
+            return value, err
+        end,
+        invalidate = function(key)
+            generation = generation + 1
+            entries[key] = nil
+        end,
+        clear = function()
+            generation = generation + 1
+            entries = {}
+        end,
+    }
+end
+
 -- Shared Rift account client: one sign-in used by every app (per profile storage).
 riftModules.account = function(store, ui)
     local ACCOUNT_FILE, LEGACY_FILE = "rift/account.json", "rift-jobs/login.json"
@@ -3626,34 +3887,30 @@ riftModules.account = function(store, ui)
         local ok, saved = pcall(store.write, ACCOUNT_FILE, data)
         return ok and saved and true or false
     end
-    local function ensureRednet()
-        for _, name in ipairs(peripheral.getNames()) do
-            if peripheral.getType(name) == "modem" and rednet.isOpen(name) then return true end
-        end
-        for _, name in ipairs(peripheral.getNames()) do
-            if peripheral.getType(name) == "modem" then
-                rednet.open(name)
-                return true
-            end
-        end
-        return false
+    local function ensureWifi()
+        if riftWifiState.isConnected() then return true end
+        return false, "Connect the launcher to Rift Wi-Fi before contacting the server."
     end
     local function request(message)
-        if not ensureRednet() then return nil, "Attach a modem to use your Rift account." end
-        local protocol = "rift_account_v1"
-        local serverId = rednet.lookup(protocol, "rift-server")
-        if not serverId then
-            protocol = "rift_jobs_v1"
-            serverId = rednet.lookup(protocol, "rift-jobs")
+        local wifiReady, wifiError = ensureWifi()
+        if not wifiReady then return nil, wifiError end
+        local wifi = riftWifiState.api
+        message.riftService = "rift_account_v1"
+        message.riftSession = riftWifiState.session
+        local sent, sendError = wifi.send("rift.local", message)
+        if not sent then return nil, sendError or "Could not send to the Rift account server." end
+        local deadline = os.clock() + 5
+        while os.clock() < deadline do
+            local packet = wifi.receive(deadline - os.clock())
+            if not packet then break end
+            local response = type(packet) == "table" and packet.message
+            if type(response) == "table" and response.riftService == message.riftService
+                and response.riftSession == message.riftSession then
+                if response.type == "error" then return nil, response.message or "The request failed." end
+                return response
+            end
         end
-        if not serverId then return nil, "Rift account server not found." end
-        rednet.send(serverId, message, protocol)
-        local senderId, response = rednet.receive(protocol, 5, serverId)
-        if senderId ~= serverId or type(response) ~= "table" then
-            return nil, "No response from the Rift account server."
-        end
-        if response.type == "error" then return nil, response.message or "The request failed." end
-        return response
+        return nil, "No response from the Rift account server."
     end
     local function authenticate(action, username, password)
         if type(username) ~= "string" or username == "" or type(password) ~= "string" or password == "" then
@@ -3670,6 +3927,10 @@ riftModules.account = function(store, ui)
         data.password = password
         save(data)
         state.user = response.username
+        if riftModules.accountUser ~= response.username then
+            riftModules.accountUser = response.username
+            riftModules.accountRevision = (riftModules.accountRevision or 0) + 1
+        end
         return true, response.username
     end
 
@@ -3678,6 +3939,7 @@ riftModules.account = function(store, ui)
         return data and data.username or nil
     end
     api.current = function() return state.user end
+    api.sessionUser = function() return riftModules.accountUser end
     api.login = function(username, password) return authenticate("login", username, password) end
     api.register = function(username, password) return authenticate("register", username, password) end
     api.lookup = function(identifier)
@@ -3703,6 +3965,8 @@ riftModules.account = function(store, ui)
             save(data)
         end
         state.user = nil
+        riftModules.accountUser = nil
+        riftModules.accountRevision = (riftModules.accountRevision or 0) + 1
         if not response then return false, err end
         return true
     end
@@ -4272,6 +4536,12 @@ showSessionMenu = function(inProgram)
             if #list == 0 then options[#options + 1] = { "(no services)", "none" } end
             options[#options + 1] = { "< Back", "back" }
         else
+            if not recoverySession then
+                options[#options + 1] = {
+                    riftWifiState.isConnected() and "Wi-Fi: Disconnect" or "Wi-Fi: Connect",
+                    "wifi_toggle",
+                }
+            end
             options[#options + 1] = { "Lock", "lock" }
             options[#options + 1] = { "Switch User", "switch_user" }
             options[#options + 1] = { "Logout", "logout" }
@@ -4379,6 +4649,11 @@ showSessionMenu = function(inProgram)
             elseif service.path then
                 bgServices.api.start(service.name)
             end
+            local keep = highlighted
+            buildOptions()
+            highlighted = math.min(keep, #options)
+        elseif option[2] == "wifi_toggle" then
+            riftWifiState.toggle()
             local keep = highlighted
             buildOptions()
             highlighted = math.min(keep, #options)
@@ -5217,12 +5492,12 @@ local function wipeRecoveryComputer()
 end
 
 local function launcherMain()
-openWirelessRednetModems()
 bootFlow.handleRecovery()
 local startupError = bootFlow.loadSettings()
 local downloaderReady, downloaderError = bootFlow.prepareLauncherUpdate()
 local systemAppInstallMessage = bootFlow.installSystemApps(downloaderReady, downloaderError)
 bootFlow.signIn()
+riftWifiState.start()
 bootFlow.completeBoot(systemAppInstallMessage)
 
 refreshApps()
